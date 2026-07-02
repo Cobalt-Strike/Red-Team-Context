@@ -1,0 +1,10 @@
+# Copy this file to config/local.cna and update local values.
+# config/local.cna is intentionally ignored by git.
+
+global('$bh_url_base $bh_token_id $bh_token_key');
+
+################### BloodHound ###################
+
+$bh_url_base = "http://127.0.0.1:8080";
+$bh_token_id = "";
+$bh_token_key = "";

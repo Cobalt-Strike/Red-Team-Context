@@ -1,0 +1,2513 @@
+# Standalone BloodHound Aggressor Extension
+# Load this file directly from Cobalt Strike Script Manager.
+
+debug(7 | 34); # 34 is required for try/catch
+
+import java.net.URL;
+import java.net.URLEncoder;
+import java.io.File;
+import javax.net.ssl.SSLContext;
+import java.security.SecureRandom;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.util.Base64;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+
+# Loads package-local BloodHound configuration without versioning secrets.
+sub __bh_load_config {
+    local('@paths $path $resolved_path $file');
+
+    @paths = @(
+        "config/local.cna",
+        "local.cna"
+    );
+
+    foreach $path (@paths) {
+        $resolved_path = script_resource($path);
+        $file = [new File: $resolved_path];
+        if ([$file exists]) {
+            include($resolved_path);
+            return 1;
+        }
+    }
+
+    println("[BloodHound] No config/local.cna found. Copy config/local.example.cna to config/local.cna and set the BloodHound API values.");
+    return 0;
+}
+
+################### PACKAGE-LOCAL REST AND JSON HELPERS ###################
+
+# Generic REST request and JSON helpers.
+# Shared by modules that need HTTP/TLS transport or JSON serialization without Cobalt Strike REST authentication.
+
+# Enable debugging for common developer mistakes and error handling
+# 7 = display runtime warnings for undeclared variables
+# 34 = throw errors flagged for use with &checkError
+# Always keep 34 enabled
+
+################### CONFIG ###################
+global('$bh_url_base $bh_token_id $bh_token_key $bh_last_error');
+
+# Configure these variables in config/local.cna.
+$bh_url_base = "";
+$bh_token_id = "";
+$bh_token_key = "";
+$bh_last_error = $null;
+__bh_load_config();
+
+# makeAPIRequest: Performs a generic HTTP request to the API
+# Arguments:
+#   $url: Full URL to request
+#   %props: Map of properties (method, headers, body, skipVerify)
+# Returns: Map with response status and content
+sub __bh_http_request {
+    local('$url %props $url_obj $method %headers $body $conn $os $status $key $value $sc %response $in $error $contentType $contentLength $isFileDownload');
+    ($url, %props) = @_;
+    
+    $method = iff(%props["method"] is $null, "GET", %props["method"]);
+    %headers = iff(%props["headers"] is $null, %(), %props["headers"]);
+    $body = %props["body"];
+
+    debug("[__bh_http_request] Connecting to URL: $url");
+    $url_obj = [new URL: $url];
+    $conn = [$url_obj openConnection];
+
+    # Optionally skip SSL verification
+    if (%props["skipVerify"] == 1 && lc([$url_obj getProtocol]) eq "https") {
+        $sc = [SSLContext getInstance: "TLS"];
+        [$sc init: $null, @(
+            newInstance(^javax.net.ssl.X509TrustManager, { return @(); })
+        ), [new SecureRandom]];
+        [$conn setSSLSocketFactory: [$sc getSocketFactory]];
+        [$conn setHostnameVerifier: newInstance(^javax.net.ssl.HostnameVerifier, { return 1; })]
+    }
+
+    [$conn setRequestMethod: $method];
+
+    # Set request headers
+    foreach $key => $value (%headers) {
+        [$conn setRequestProperty: $key, $value];
+    }
+
+    # Write request body if present
+    if ($body !is $null) {
+        [$conn setDoOutput: 1];
+        $os = [$conn getOutputStream];
+        [$os write: $body];
+        [$os flush];
+        [$os close];
+    }
+
+    # Prepare response map
+    $contentType = [$conn getHeaderField: "Content-Type"];
+    $contentLength = [$conn getHeaderField: "Content-Length"];
+    if (lc("" . $contentType) ismatch "^application/octet-stream" && $contentLength > 0) {
+        $isFileDownload = 1;
+    }
+    else {
+        $isFileDownload = 0;
+    }
+    $status = [$conn getResponseCode];
+    %response = %(
+        status => $status,
+        headers => [$conn getHeaderFields],
+        content => "",
+        isFileDownload => $isFileDownload
+    );
+
+    # Read response content
+    try {
+        if ($status >= 400) {
+            $error = [$conn getErrorStream];
+            if ($error !is $null) {
+                $in = $error;
+            }
+        }
+        else {
+            $in = [$conn getInputStream];
+        }
+
+        if ($in !is $null) {
+            %response["content"] = [$in readAllBytes];
+            if ($isFileDownload == 0) {
+                %response["content"] = [new String: %response["content"], "UTF-8"];
+            }
+        }
+    }
+    catch $exp {
+        println("[__bh_http_request] Exception: " . $exp);
+        println("[__bh_http_request] Connection refused or other error at URL: $url");
+    }
+    return %response;
+}
+
+# __bh_response_success: Returns true for HTTP 2xx statuses
+sub __bh_response_success {
+    local('$status $status_text');
+    $status = $1;
+
+    if ($status is $null) {
+        return 0;
+    }
+
+    $status_text = [[new String: ("" . $status)] trim];
+    if ($status_text ismatch "^2[0-9][0-9]L?$") {
+        return 1;
+    }
+
+    if ($status >= 200) {
+        if ($status < 300) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+# __bh_response_last_error: Classifies common HTTP/API failure states
+sub __bh_response_last_error {
+    local('$response $status');
+    $response = $1;
+
+    if ($response is $null) {
+        return "APP_UNAVAILABLE";
+    }
+
+    $status = $response["status"];
+
+    if ($status is $null || $status eq "") {
+        return "APP_UNAVAILABLE";
+    }
+
+    if (__bh_response_success($status)) {
+        return $null;
+    }
+
+    if ($status == 401 || $status == 403) {
+        return "AUTH_FAILED";
+    }
+
+    return "REQUEST_FAILED";
+}
+
+# __bh_json_parser: Simple JSON parser that converts JSON strings to Sleep data structures
+# Arguments:
+#   $1: JSON string to parse
+# Returns: Sleep data structure (map/array)
+sub __bh_json_parser {
+    local('$parser %parser $lexer %lexer $withTokenKind $dispatcher');
+
+    $dispatcher = { return invoke(%FN[$0], @_, $0, \$this); };
+
+    $withTokenKind = {
+        return let(
+            $1,
+            $KIND_OCURLY => 1, $KIND_CCURLY => 2, $KIND_OBRACKET => 3, $KIND_CBRACKET => 4, $KIND_COMMA => 5, $KIND_COLON => 6,
+            $KIND_STRING => 7, $KIND_NUMBER => 8, $KIND_TRUE => 9, $KIND_FALSE => 10, $KIND_NULL => 11,
+            $Token => { return @_; },
+            $Type =>  { return $1[0]; },
+            $Value => { return $1[1]; }
+        );
+    };
+
+    %lexer = %(
+        nextToken => {
+            local('$c');
+            [$this skipWhitespace];
+            $c = [$this peek];
+            if ($c is $null) {                        return $null; }
+            if ($c eq '{') { [$this chop];            return [$Token: $KIND_OCURLY]; }
+            if ($c eq '}') { [$this chop];            return [$Token: $KIND_CCURLY]; }
+            if ($c eq '[') { [$this chop];            return [$Token: $KIND_OBRACKET]; }
+            if ($c eq ']') { [$this chop];            return [$Token: $KIND_CBRACKET]; }
+            if ($c eq ',') { [$this chop];            return [$Token: $KIND_COMMA]; }
+            if ($c eq ':') { [$this chop];            return [$Token: $KIND_COLON]; }
+            if ($c eq 't') { [$this expect: "true"];  return [$Token: $KIND_TRUE, 1]; }
+            if ($c eq 'f') { [$this expect: "false"]; return [$Token: $KIND_FALSE, 0]; }
+            if ($c eq 'n') { [$this expect: "null"];  return [$Token: $KIND_NULL, $null]; }
+            if ($c eq '"') {                          return [$this lexString]; }
+            if ($c eq '-' || [$this isDigit: $c]) {   return [$this lexNumber]; }
+            throw "Unxpected char ' $+ $c $+ ' at $cursor";
+        },
+        peekToken => {
+            local('$t $old');
+            $old = $cursor;
+            $t = [$this nextToken];
+            $cursor = $old;
+            return $t;
+        },
+        expectToken => {
+            local('$t');
+            $t = [$this nextToken];
+            if ($t is $null) { throw "EOF: Expected $1";}
+            if ([$Type: $t] ne $1) { throw "Expected token $1 but got " . [$Type: $t]; }
+            return $t;
+        },
+        peek => {
+            if ($cursor < strlen($input)) {
+                return charAt($input, $cursor);
+            }
+            return $null;
+        },
+        chop => {
+            local('$c');
+            if ($cursor < strlen($input)) {
+                $c = charAt($input, $cursor);
+                $cursor++;
+                if ($c eq "\n") { $line++; $col = 1; } else { $col++; }
+                return $c;
+            }
+            return $null;
+        },
+        expect => {
+            local('$s');
+            if ($cursor + strlen($1) > strlen($input)) { throw "EOF: Expected ' $+ $1 $+ ' at $line $+ : $+ $col but got $+ ' $s $+ '"; }
+            $s = substr($input, $cursor, $cursor + strlen($1));
+            if ($s ne $1) { throw "Expected ' $+ $1 $+ ' at $line $+ : $+ $col but got $+ ' $s $+ '"; }
+            $cursor = $cursor + strlen($s);
+            $col += strlen($s);
+            return $s;
+        },
+        skipWhitespace => {
+            local('$c');
+            $c = [$this peek];
+            while ($c !is $null && $c ismatch '\r|\n|\t| ') {
+                [$this chop];
+                $c = [$this peek];
+            }
+        },
+        lexString => {
+            local('$c $start $hasEscapedChars $str');
+            $hasEscapedChars = 0;
+            $c = [$this chop];
+            $start = $cursor;
+            while(1) {
+                $c = [$this chop];
+                if ($c is $null)     { throw "EOF: String literal not closed"; }
+                else if ($c eq "\\") { [$this skipEscape]; $hasEscapedChars = 1; }
+                else if ($c eq '"')  { break; }
+            }
+            $str = substr($input, $start, $cursor - 1);
+            if ($hasEscapedChars) { $str = [$this unescapeString: $str]; }
+            return [$Token: $KIND_STRING, $str];
+        },
+        skipEscape => {
+            local('$c $i');
+            $c = [$this chop];
+            if ($c eq '"')  { return 1; }
+            if ($c eq "\\") { return 1; }
+            if ($c eq "/")  { return 1; }
+            if ($c eq "b")  { return 1; }
+            if ($c eq "f")  { return 1; }
+            if ($c eq "n")  { return 1; }
+            if ($c eq "r")  { return 1; }
+            if ($c eq "t")  { return 1; }
+            if ($c eq "u")  {
+               for ($i = 0; $i < 4; $i++)  {
+                    $c = [$this chop];
+                    if ($c !ismatch '[0-9a-fA-F]') { throw "Expected hex-digit but got: ' $+ $c $_ '"; }
+               }
+               return 1;
+            }
+            throw "Unkown escaped char: ' $+ $c $_ '";
+        },
+        lexNumber => {
+            local('$c $start $n');
+            $start = $cursor;
+            $c = [$this peek];
+            while ($c !is $null && $c ismatch '-|\d|\.') {
+                # TODO: Support floats. Sleep's parseNumber only parse integers
+                if ($c eq ".") { throw "Floats aren't supported"; }
+                [$this chop];
+                $c = [$this peek];
+            }
+            $n = parseNumber(substr($input, $start, $cursor), 10);
+            return [$Token: $KIND_NUMBER, $n];
+        },
+        isDigit => {
+            return iff(48 <= asc($1) && asc($1) <= 57, 1, 0);
+        },
+        unescapeString => {
+            local('$i @builder $len $c $hex');
+            $len = strlen($1);
+            for ($i = 0; $i < $len; $i++) {
+                $c = charAt($1, $i);
+                if ($c eq "\\" && ($i + 1) < $len) {
+                    $i++;
+                    $c = charAt($1, $i);
+                    if ($c eq '"')       { push(@builder, '"');  }
+                    else if ($c eq "\\") { push(@builder, "\\"); }
+                    else if ($c eq "/")  { push(@builder, "/");  }
+                    else if ($c eq "b")  { push(@builder, "\b"); }
+                    else if ($c eq "f")  { push(@builder, "\f"); }
+                    else if ($c eq "n")  { push(@builder, "\n"); }
+                    else if ($c eq "r")  { push(@builder, "\r"); }
+                    else if ($c eq "t")  { push(@builder, "\t"); }
+                    else if ($c eq "u")  {
+                        if (($i + 4) < $len) {
+                            $hex = substr($1, $i + 1, $i + 5);
+                            push(@builder, chr(parseNumber($hex, 16)));
+                            $i += 4;
+                        }
+                        else {
+                            throw "Bad \\u escape";
+                        }
+                    }
+                }
+                else {
+                    push(@builder, $c);
+                }
+            }
+            return join("", @builder);
+        },
+        init => {
+            $input = $1;
+            $cursor = 0;
+            $line = 1;
+            $col = 1;
+        }
+    );
+
+    %parser = %(
+        parse => {
+            local('$t $v');
+            [$lexer init: $1];
+            $v = [$this parseElem];
+            [$lexer skipWhitespace];
+            $t = [$lexer nextToken];
+            if ($t !is $null) { throw "Trailing data after JSON value"; }
+            return $v;
+        },
+        parseElem => {
+            local('$t $kind');
+            $t = [$lexer nextToken];
+            $kind = [$Type: $t];
+            if ($kind == $KIND_OCURLY) { return [$this parseObject]; }
+            if ($kind == $KIND_OBRACKET) { return [$this parseArray]; }
+            if ($KIND_STRING <= $kind && $kind <= $KIND_NULL) { return [$Value: $t]; }
+            throw "Unxpected token: " . $kind;
+        },
+        parseObject => {
+            local('$t $key $value %obj')
+            $t = [$lexer nextToken];
+            if ($t is $null) { throw "EOF: Object is not closed"; }
+            while([$Type: $t] != $KIND_CCURLY) {
+                if ([$Type: $t] != $KIND_STRING) { throw "Expected a string for the object key, got " . $t['type']; }
+                $key = [$Value: $t];
+                [$lexer expectToken: $KIND_COLON];
+                %obj[$key] = [$this parseElem];
+
+                $t = [$lexer nextToken];
+                if ([$Type: $t] == $KIND_COMMA) { $t = [$lexer nextToken]; }
+            }
+            return %obj;
+        },
+        parseArray => {
+            local('$t $key $value @arr')
+            $t = [$lexer peekToken];
+            if ($t is $null) { throw "EOF: Array is not closed"; }
+            while([$Type: $t] != $KIND_CBRACKET) {
+                push(@arr, [$this parseElem]);
+                $t = [$lexer peekToken];
+                if ([$Type: $t] == $KIND_COMMA) { [$lexer nextToken]; $t = [$lexer peekToken]; }
+            }
+            [$lexer nextToken];
+            return @arr;
+        }
+    );
+
+    return [$withTokenKind: lambda($dispatcher,
+        %FN => %parser,
+        $lexer => [$withTokenKind: lambda($dispatcher,
+            %FN => %lexer,
+            $input => $null,
+            $cursor => 0,
+            $line => 1,
+            $col  => 1
+        )]
+    )];
+}
+
+# JsonSerializer: Produces JSON text from Sleep data structures (inverse of JsonParser)
+sub __bh_json_serializer {
+    local('$serializer %serializer $dispatcher');
+
+    $dispatcher = { return invoke(%FN[$0], @_, $0, \$this); };
+
+    %serializer = %(
+        stringify => {
+            return [$this stringifyValue: $1];
+        },
+        stringifyValue => {
+            local('$value $type $scalar $scalarLower');
+            $value = $1;
+
+            if ($value is $null) {
+                return "null";
+            }
+
+            $type = typeOf($value);
+
+            if (-ishash $value) {
+                return [$this stringifyObject: $value];
+            }
+            if (-isarray $value) {
+                return [$this stringifyArray: $value];
+            }
+
+            $scalar = $value . "";
+            $scalarLower = [$scalar toLowerCase];
+			
+			if (__bh_json_is_number($scalar)) {
+                return $scalar;
+            }
+
+            if ($scalarLower eq "true") {
+                return "true";
+            }
+            if ($scalarLower eq "false") {
+                return "false";
+            }
+
+            return [$this stringifyString: $scalar];
+        },
+        stringifyObject => {
+            local('$object $result $first $key $value');
+            $object = $1;
+            $result = "{";
+            $first = 1;
+
+            foreach $key => $value ($object) {
+                if ($first == 0) {
+                    $result = $result . ",";
+                }
+                $first = 0;
+                $result = $result . [$this stringifyString: $key] . ":" . [$this stringifyValue: $value];
+            }
+
+            $result = $result . "}";
+            return $result;
+        },
+        stringifyArray => {
+            local('$array $result $first $item');
+            $array = $1;
+            $result = "[";
+            $first = 1;
+
+            foreach $item ($array) {
+                if ($first == 0) {
+                    $result = $result . ",";
+                }
+                $first = 0;
+                $result = $result . [$this stringifyValue: $item];
+            }
+
+            $result = $result . "]";
+            return $result;
+        },
+        stringifyString => {
+            local('$str $out $i $len $c $code');
+            
+            $str = $1 . "";
+            $len = strlen($str);
+            $out = "\"";
+
+            for ($i = 0; $i < $len; $i++) {
+                $c = charAt($str, $i);
+                $code = asc($c);
+
+                if ($c eq "\\") {
+                    $out .= "\\\\";
+                }
+                else if ($c eq "\"") {
+                    $out .= "\\\"";
+                }
+                else if ($code == 8) {
+                    $out .= "\\b";
+                }
+                else if ($code == 12) {
+                    $out .= "\\f";
+                }
+                else if ($c eq "\n") {
+                    $out .= "\\n";
+                }
+                else if ($c eq "\r") {
+                    $out .= "\\r";
+                }
+                else if ($c eq "\t") {
+                    $out .= "\\t";
+                }
+                else if ($code < 32) {
+                    # non-ASCII: encode as \uXXXX
+                    $out .= "\\u" . __bh_json_hex($code);
+                }
+                else {
+                    $out .= $c;
+                }
+            }
+
+            return $out . "\"";
+        }
+    );
+
+    return lambda($dispatcher,
+        %FN => %serializer
+    );
+}
+
+# Helper to convert an integer to a zero-padded hexadecimal string
+sub __bh_json_hex {
+    local('$num $hex $digits $digit');
+    $num = $1;
+    $digits = "0123456789abcdef";
+    $hex = "";
+
+    if ($num == 0) {
+        $hex = "0";
+    }
+    else {
+        while ($num > 0) {
+            $digit = $num % 16;
+            $hex = substr($digits, $digit, $digit + 1) . $hex;
+            $num = ($num - $digit) / 16;
+        }
+    }
+
+    while (strlen($hex) < 4) {
+        $hex = "0" . $hex;
+    }
+
+    return substr($hex, strlen($hex) - 4, strlen($hex));
+}
+
+sub __bh_json_is_number {
+    local('$text $t');
+    $text = $1;
+    if ($text is $null) {
+        return 0;
+    }
+    $t = typeOf($text);
+    return iff(($t eq "class sleep.engine.types.LongValue") || ($t eq "class sleep.engine.types.DoubleValue"),1,0);
+}
+
+# Convenience wrapper for callers who just want the JSON text
+sub __bh_to_json {
+    local('$data $serializer');
+    $data = $1;
+    $serializer = __bh_json_serializer();
+    return [$serializer stringify: $data];
+}
+
+# Converts response content to text when the shared REST transport returned bytes
+sub __bh_rest_content_text {
+    local('$content');
+    $content = $1;
+
+    if ($content is $null) {
+        return "";
+    }
+
+    if (-isarray $content || -ishash $content) {
+        return $content;
+    }
+
+    try {
+        return [new String: $content, "UTF-8"];
+    }
+    catch $e {
+        return "" . $content;
+    }
+}
+
+# Returns true if response content has a JSON object/array shape
+sub __bh_rest_content_is_json {
+    local('$content $text');
+    $content = $1;
+
+    if ($content is $null) {
+        return 0;
+    }
+
+    if (-isarray $content || -ishash $content) {
+        return 1;
+    }
+
+    $text = [[new String: ("" . __bh_rest_content_text($content))] trim];
+    if ($text eq "") {
+        return 0;
+    }
+
+    return iff((charAt($text, 0) eq "{") || (charAt($text, 0) eq "["), 1, 0);
+}
+
+# __bh_parse_json: Converts the 'content' field of a JSON API response to a Sleep hash/array
+# Arguments:
+#   $1: Map containing API response (with 'content' field as JSON string)
+# Returns: Map with 'content' field replaced by parsed Sleep hash/array
+sub __bh_parse_json{
+    local('$response $content $jsonParser $sleepArray');
+    $response = $1;
+
+    if ($response is $null) {
+        return $response;
+    }
+
+    if ($response["isFileDownload"] == 0 && __bh_rest_content_is_json($response["content"])) {
+        $content = $response["content"];
+        if (-isarray $content || -ishash $content) {
+            return $response;
+        }
+
+        $response["content"] = __bh_rest_content_text($content);
+        $jsonParser = __bh_json_parser();
+        $sleepArray = [$jsonParser parse: $response["content"]];
+        $response["content"] = $sleepArray;
+    }
+
+    return $response;
+}
+
+
+
+################### BLOODHOUND API AND QUERY HELPERS ###################
+
+################### BLOODHOUND HELPERS ###################
+
+# This function trims leading and trailing whitespace from a string
+sub __bh_trim {
+    return [[new String: ("" . $1)] trim];
+}
+
+# This function returns the request path used in BloodHound request signing
+sub __bh_request_uri {
+    local('$endpoint');
+    $endpoint = $1;
+
+    if (charAt($endpoint, 0) eq "/") {
+        return $endpoint;
+    }
+
+    return "/" . $endpoint;
+}
+
+# This function computes an HMAC-SHA256 digest
+sub __bh_hmac_sha256 {
+    local('$key_bytes $message_bytes $mac');
+    ($key_bytes, $message_bytes) = @_;
+
+    $mac = [Mac getInstance: "HmacSHA256"];
+    [$mac init: [new SecretKeySpec: $key_bytes, "HmacSHA256"]];
+
+    if ($message_bytes !is $null) {
+        [$mac update: $message_bytes];
+    }
+
+    return [$mac doFinal];
+}
+
+# This function returns the Host header for BloodHound request signing from $bh_url_base
+sub __bh_host_header {
+    local('$url_obj $host $port');
+
+    if ($bh_url_base is $null || $bh_url_base eq "") {
+        return "";
+    }
+
+    $url_obj = [new URL: $bh_url_base];
+    $host = [$url_obj getHost];
+    $port = [$url_obj getPort];
+
+    if ($port > 0) {
+        return $host . ":" . $port;
+    }
+
+    return $host;
+}
+
+# This function returns true when required BloodHound API settings are present
+sub __bh_config_ready {
+    if ($bh_url_base eq "" || $bh_token_id eq "" || $bh_token_key eq "") {
+        return 0;
+    }
+    return 1;
+}
+
+# This function returns a standard response when BloodHound configuration is incomplete
+sub __bh_config_error_response {
+    return %(status => 0, headers => %(), content => "BloodHound configuration is incomplete. Copy config/local.example.cna to config/local.cna and set \$bh_url_base, \$bh_token_id, and \$bh_token_key.", isFileDownload => 0);
+}
+# This function builds the BloodHound signed-auth headers from the API token pair
+sub __bh_signed_headers {
+    local('$method $endpoint $body $request_uri $request_date $date_hour $operation_key $date_key $body_bytes $signature_bytes $signature %headers');
+    ($method, $endpoint, $body) = @_;
+
+    $request_uri = __bh_request_uri($endpoint);
+    $request_date = [[ZonedDateTime now] format: [DateTimeFormatter ofPattern: "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"]];
+    $date_hour = substr($request_date, 0, 13);
+
+    $operation_key = __bh_hmac_sha256([$bh_token_key getBytes: "UTF-8"], [($method . $request_uri) getBytes: "UTF-8"]);
+    $date_key = __bh_hmac_sha256($operation_key, [$date_hour getBytes: "UTF-8"]);
+
+    if ($body !is $null) {
+        $body_bytes = [$body getBytes: "UTF-8"];
+    }
+    else {
+        $body_bytes = $null;
+    }
+
+    $signature_bytes = __bh_hmac_sha256($date_key, $body_bytes);
+    $signature = [[Base64 getEncoder] encodeToString: $signature_bytes];
+
+    %headers = %(
+        User-Agent => "bhe-python-sdk 0001",
+        Authorization => "bhesignature " . $bh_token_id,
+        RequestDate => $request_date,
+        Signature => $signature,
+        Accept => "application/json",
+        Prefer => "wait=30",
+        Content-Type => "application/json",
+        Host => __bh_host_header(),
+        Connection => "close"
+    );
+
+    return %headers;
+}
+
+# This function normalizes shared REST helper response content to text
+sub __bh_response_content_to_text {
+    local('$content');
+    $content = $1;
+
+    if ($content is $null) {
+        return "";
+    }
+
+    if (-isarray $content || -ishash $content) {
+        return $content;
+    }
+
+    try {
+        return [new String: $content, "UTF-8"];
+    }
+    catch $e {
+        return "" . $content;
+    }
+}
+
+# This function performs an HTTP/HTTPS request to BloodHound with signed headers
+sub __bh_makeAPIRequest {
+    local('$url %props $method $body %headers $request_body $response');
+    ($url, %props) = @_;
+
+    $method = iff(%props["method"] is $null, "GET", %props["method"]);
+    $body = iff(%props["body"] is $null, "", %props["body"]);
+    %headers = iff(%props["headers"] is $null, %(), %props["headers"]);
+    $request_body = iff($body eq "", $null, [$body getBytes: "UTF-8"]);
+
+    $response = __bh_http_request($url, %(method => $method, headers => %headers, body => $request_body, skipVerify => 1));
+    $response["content"] = __bh_response_content_to_text($response["content"]);
+    return $response;
+}
+
+# This function checks whether the response body looks like JSON before parsing it
+sub __bh_is_json_response {
+    local('$content');
+    $content = $1;
+
+    if ($content is $null) {
+        return 0;
+    }
+
+    if (-isarray $content || -ishash $content) {
+        return 1;
+    }
+
+    $content = __bh_trim($content);
+    if ($content eq "") {
+        return 0;
+    }
+
+    return iff((charAt($content, 0) eq "{") || (charAt($content, 0) eq "["), 1, 0);
+}
+
+sub __bh_parse_json_response {
+    local('$response');
+    $response = $1;
+
+    if ($response is $null) {
+        return $response;
+    }
+
+    $response["content"] = __bh_response_content_to_text($response["content"]);
+    if ($response["content"] is $null || $response["content"] eq "") {
+        return $response;
+    }
+    if (-ishash $response["content"] || -isarray $response["content"]) {
+        return $response;
+    }
+
+    try {
+        return __bh_parse_json($response);
+    }
+    catch $e {
+        return $response;
+    }
+}
+
+# This function prints clearer console messages for common BloodHound errors
+sub __bh_log_error {
+    local('$action $response $status $content');
+    ($action, $response) = @_;
+    $status = "" . $response["status"];
+    $content = $response["content"];
+
+    if ($status is $null || $status eq "") {
+        println("[BloodHound] " . $action . " failed. BloodHound does not appear to be available at " . $bh_url_base . ".");
+        show_error("[BloodHound] Verify the service is running and reachable, then try again.");
+        return;
+    }
+
+    if ($status eq "401" || $status eq "403") {
+        println("[BloodHound] " . $action . " failed with status " . $status . ".");
+        show_error("[BloodHound] Authentication was rejected. Verify the BloodHound token ID/key and request signing.");
+        if ($content !is $null && $content ne "") {
+            println("[BloodHound] Server response: " . $content);
+        }
+        return;
+    }
+
+    if ($status ismatch "^5\\d\\d") {
+        println("[BloodHound] " . $action . " failed with server error " . $status . ".");
+        if ($content !is $null && $content ne "") {
+            show_error("[BloodHound] Server response: " . $content);
+        }
+        return;
+    }
+
+    println("[BloodHound] " . $action . " failed with status " . $status . ".");
+    if ($content !is $null && $content ne "") {
+        println("[BloodHound] Server response: " . $content);
+    }
+}
+
+# This function performs a raw BloodHound request and safely parses JSON responses
+sub __bh_request {
+    local('$method $endpoint $body %headers $url $response');
+    ($method, $endpoint, $body, %headers) = @_;
+    $url = $bh_url_base . $endpoint;
+    $response = __bh_makeAPIRequest($url, %(method => $method, headers => %headers, body => $body));
+
+    $response = __bh_parse_json_response($response);
+
+    return $response;
+}
+
+# This function performs an authenticated request to BloodHound using the signed API token pair
+sub __bh_authenticated_request {
+    local('$method $endpoint $body %headers $response');
+    ($method, $endpoint, $body) = @_;
+    if (__bh_config_ready() == 0) {
+        $response = __bh_config_error_response();
+        $bh_last_error = "CONFIG_MISSING";
+        return $response;
+    }
+    %headers = __bh_signed_headers($method, $endpoint, $body);
+    $response = __bh_request($method, $endpoint, $body, %headers);
+    $bh_last_error = __bh_response_last_error($response);
+
+    if (__bh_response_success($response["status"]) == 0) {
+        __bh_log_error($method . " " . $endpoint, $response);
+    }
+
+    return $response;
+}
+
+# This function performs an authenticated request without printing errors for expected non-success cases
+sub __bh_authenticated_request_quiet {
+    local('$method $endpoint $body %headers $response');
+    ($method, $endpoint, $body) = @_;
+    if (__bh_config_ready() == 0) {
+        $response = __bh_config_error_response();
+        $bh_last_error = "CONFIG_MISSING";
+        return $response;
+    }
+    %headers = __bh_signed_headers($method, $endpoint, $body);
+    $response = __bh_request($method, $endpoint, $body, %headers);
+    $bh_last_error = __bh_response_last_error($response);
+    return $response;
+}
+
+# This function performs an authenticated GET request to BloodHound
+sub bhGET {
+    return __bh_authenticated_request("GET", $1, $null);
+}
+
+# This function performs an authenticated POST request to BloodHound
+sub bhPOST {
+    return __bh_authenticated_request("POST", $1, $2);
+}
+
+# This function performs an authenticated POST request to BloodHound without printing errors
+sub bhPOSTQuiet {
+    return __bh_authenticated_request_quiet("POST", $1, $2);
+}
+
+# This function performs an authenticated PUT request to BloodHound
+sub bhPUT {
+    return __bh_authenticated_request("PUT", $1, $2);
+}
+
+# This function performs an authenticated DELETE request to BloodHound
+sub bhDELETE {
+    return __bh_authenticated_request("DELETE", $1, $null);
+}
+
+sub bhCheckConnection {
+    local('$response_version $edition $version $content_text %content %data');
+
+    $response_version = bhGET("/api/version");
+    
+    if (__bh_response_success($response_version["status"])) {
+        if (-ishash $response_version["content"]) {
+            %content = $response_version["content"];
+        }
+        else {
+            $content_text = __bh_response_content_to_text($response_version["content"]);
+            if (__bh_is_json_response($content_text)) {
+                $response_version["content"] = $content_text;
+                $response_version = __bh_parse_json($response_version);
+            }
+            %content = $response_version["content"];
+        }
+        
+        %data = %content["data"];
+        if (%data is $null) {
+            %data = %content;
+        }
+
+        $edition = %data["product_edition"];
+        $version = %data["server_version"];
+        if ($edition is $null || $edition eq "") {
+            $edition = %data["edition"];
+        }
+        if ($version is $null || $version eq "") {
+            $version = %data["version"];
+        }
+
+        println("[BloodHound] BloodHound is reachable. Version: " . $edition . " (" . $version . ")");
+        return 1;
+    }
+
+    if ($bh_last_error eq "CONFIG_MISSING") {
+        println("[BloodHound] Configuration is incomplete. Copy config/local.example.cna to config/local.cna and set the BloodHound API values.");
+    }
+    else if ($bh_last_error eq "AUTH_FAILED") {
+        println("[BloodHound] Example requests skipped because token authentication failed. Check the BloodHound token ID or key.");
+    }
+    else if ($bh_last_error eq "APP_UNAVAILABLE") {
+        println("[BloodHound] Example requests skipped because the BloodHound application is not available at " . $bh_url_base . ".");
+    }
+    else {
+        println("[BloodHound] Example requests skipped because initialization failed. Status: " . $response_version["status"] . " Content: " . $response_version["content"]);
+    }
+
+    return 0;
+}
+
+################### BLOODHOUND API FUNCTIONS ###################
+
+# This function retrieves asset group tags from BloodHound
+sub bhListAssetGroupTags {
+    return bhGET("/api/v2/asset-group-tags?type=eq:3");
+}
+
+# This function quotes a scalar value for JSON request bodies
+sub __bh_json_quote {
+    local('$value');
+    $value = "" . $1;
+    $value = [$value replace: "\\", "\\\\"];
+    $value = [$value replace: "\"", "\\\""];
+    $value = [$value replace: "\r", "\\r"];
+    $value = [$value replace: "\n", "\\n"];
+    $value = [$value replace: "\t", "\\t"];
+    return "\"" . $value . "\"";
+}
+
+# This function returns the built-in Owned asset group tag ID
+sub __bh_owned_asset_group_tag_id {
+    local('$response %data @tags %tag $name $type');
+
+    $response = bhListAssetGroupTags();
+    if (__bh_response_success($response["status"]) == 0) {
+        return "";
+    }
+
+    %data = $response["content"]["data"];
+    @tags = %data["tags"];
+    if (@tags is $null) {
+        return "";
+    }
+
+    foreach %tag (@tags) {
+        $name = lc(__bh_trim(%tag["name"]));
+        $type = "" . %tag["type"];
+
+        if ($name eq "owned" || $type eq "3") {
+            return %tag["id"];
+        }
+    }
+
+    return "";
+}
+
+# This function returns a readable selector name for an Owned selector
+sub __bh_owned_selector_name {
+    local('%node %properties $name');
+    %node = $1;
+
+    if (%node is $null) {
+        return "";
+    }
+
+    if (%node["label"] !is $null && %node["label"] ne "") {
+        return "" . %node["label"];
+    }
+    if (%node["name"] !is $null && %node["name"] ne "") {
+        return "" . %node["name"];
+    }
+
+    %properties = %node["properties"];
+    if (%properties !is $null) {
+        if (%properties["name"] !is $null && %properties["name"] ne "") {
+            return "" . %properties["name"];
+        }
+        if (%properties["displayname"] !is $null && %properties["displayname"] ne "") {
+            return "" . %properties["displayname"];
+        }
+    }
+
+    return __bh_graph_node_object_id(%node);
+}
+
+# This function resolves an object reference to the object ID required by the Owned selector API
+sub __bh_owned_selector_target {
+    local('$object_ref $selector_name $query $response %nodes $node_id %node $object_id $node_count %target');
+    ($object_ref, $selector_name) = @_;
+
+    $query = "WITH " . __bh_cypher_quote($object_ref) . " AS target MATCH (n) WHERE toLower(n.objectid) = toLower(target) OR toLower(n.name) = toLower(target) OR (NOT (target CONTAINS '@') AND (toLower(n.name) STARTS WITH toLower(target + '@') OR toLower(n.name) STARTS WITH toLower(target + '.'))) RETURN n ORDER BY n.name LIMIT 2";
+    $response = bhRunCypherWithProperties($query);
+
+    if (__bh_response_success($response["status"]) == 1) {
+        %nodes = $response["content"]["data"]["nodes"];
+        $node_count = iff(%nodes is $null, 0, size(%nodes));
+
+        if ($node_count == 1) {
+            foreach $node_id => %node (%nodes) {
+                $object_id = __bh_graph_node_object_id(%node);
+                if ($selector_name eq "") {
+                    $selector_name = __bh_owned_selector_name(%node);
+                }
+            }
+        }
+        else if ($node_count > 1) {
+            show_error("[BloodHound] Multiple objects matched: " . $object_ref . ". Use a SID/object ID or fully qualified BloodHound name.");
+            return %(object_id => "", selector_name => "");
+        }
+    }
+
+    if ($object_id eq "") {
+        $object_id = $object_ref;
+    }
+    if ($selector_name eq "") {
+        $selector_name = $object_ref;
+    }
+
+    %target = %(object_id => $object_id, selector_name => $selector_name);
+    return %target;
+}
+
+# This function marks a BloodHound object as owned by adding it to the built-in Owned label
+sub bhAddToOwned {
+    local('$object_ref $selector_name $asset_group_tag_id $body %target');
+    $object_ref = __bh_trim($1);
+    $selector_name = iff(size(@_) >= 2, __bh_trim($2), "");
+
+    if ($object_ref eq "") {
+        show_error("[BloodHound] bhAddToOwned requires an object name, SID, or object ID.");
+        return %(status => 400, headers => %(), content => %(error => "missing sid"), isFileDownload => 0);
+    }
+
+    %target = __bh_owned_selector_target($object_ref, $selector_name);
+    if (%target["object_id"] eq "") {
+        return %(status => 400, headers => %(), content => %(error => "ambiguous object reference"), isFileDownload => 0);
+    }
+
+    $asset_group_tag_id = __bh_owned_asset_group_tag_id();
+    if ($asset_group_tag_id eq "") {
+        show_error("[BloodHound] Unable to find the built-in Owned asset group tag.");
+        return %(status => 404, headers => %(), content => %(error => "owned asset group tag not found"), isFileDownload => 0);
+    }
+
+    $body = "{" .
+        "\"name\":" . __bh_json_quote(%target["selector_name"]) . "," .
+        "\"seeds\":[{\"type\":1,\"value\":" . __bh_json_quote(%target["object_id"]) . "}]" .
+    "}";
+
+    return bhPOST("/api/v2/asset-group-tags/" . $asset_group_tag_id . "/selectors", $body);
+}
+
+# This function runs a raw Cypher query in BloodHound
+sub bhRunCypher {
+    local('%body $body');
+    %body = %(query => $1);
+    $body = __bh_to_json(%body);
+    return bhPOST("/api/v2/graphs/cypher", $body);
+}
+
+# This function runs a raw Cypher query and asks BloodHound to include node properties
+sub bhRunCypherWithProperties {
+    local('%body $body');
+    %body = %(query => $1, include_properties => "true");
+    $body = __bh_to_json(%body);
+    return bhPOST("/api/v2/graphs/cypher", $body);
+}
+
+# This function runs a raw Cypher query with node properties without printing errors
+sub bhRunCypherWithPropertiesQuiet {
+    local('%body $body');
+    %body = %(query => $1, include_properties => "true");
+    $body = __bh_to_json(%body);
+    return bhPOSTQuiet("/api/v2/graphs/cypher", $body);
+}
+
+# This function runs a raw Cypher query in BloodHound without printing errors
+sub bhRunCypherQuiet {
+    local('%body $body');
+    %body = %(query => $1);
+    $body = __bh_to_json(%body);
+    return bhPOSTQuiet("/api/v2/graphs/cypher", $body);
+}
+
+# This function escapes a scalar value for use in generated Cypher strings
+sub __bh_cypher_quote {
+    local('$value');
+    $value = "" . $1;
+    $value = [$value replace: "\\", "\\\\"];
+    $value = [$value replace: "'", "\\'"];
+    return "'" . $value . "'";
+}
+
+# This function builds a Cypher string list from one or more values
+sub __bh_cypher_string_list {
+    local('@values @quoted_values %seen $value $key $first_value');
+    @values = @_;
+
+    $first_value = @values[0];
+    if (size(@values) == 1 && -isarray $first_value) {
+        @values = $first_value;
+    }
+
+    foreach $value (@values) {
+        if ($value !is $null && $value ne "") {
+            $key = lc("" . $value);
+            if ($key !in %seen) {
+                %seen[$key] = 1;
+                push(@quoted_values, __bh_cypher_quote($value));
+            }
+        }
+    }
+
+    return "[" . join(", ", @quoted_values) . "]";
+}
+
+# This function expands DOMAIN\user input into BloodHound-friendly user candidates
+sub __bh_user_target_candidates {
+    local('$target $slash_index $domain $username @candidates @unique_candidates %seen $candidate $key');
+    $target = __bh_trim($1);
+
+    if ($target ne "") {
+        push(@candidates, $target);
+    }
+
+    $slash_index = [$target indexOf: "\\"];
+    if ($slash_index > 0) {
+        $domain = [$target substring: 0, $slash_index];
+        $username = [$target substring: $slash_index + 1];
+        if ($username ne "") {
+            push(@candidates, $username);
+            if ($domain ne "") {
+                push(@candidates, $username . "@" . $domain);
+            }
+        }
+    }
+
+    foreach $candidate (@candidates) {
+        $key = lc("" . $candidate);
+        if ($key !in %seen) {
+            %seen[$key] = 1;
+            push(@unique_candidates, $candidate);
+        }
+    }
+
+    return @unique_candidates;
+}
+
+# This function returns the shared Cypher expression used to match BloodHound users by object ID, UPN, DOMAIN\user, or samAccountName
+sub __bh_user_match_expression {
+    local('$user_alias $target_alias');
+    ($user_alias, $target_alias) = @_;
+    return "toLower(" . $user_alias . ".objectid) = toLower(" . $target_alias . ") OR toLower(" . $user_alias . ".name) = toLower(" . $target_alias . ") OR (NOT (" . $target_alias . " CONTAINS '@') AND toLower(" . $user_alias . ".name) STARTS WITH toLower(" . $target_alias . " + '@'))";
+}
+
+sub __bh_computer_match_expression {
+    local('$computer_alias $target_alias');
+    ($computer_alias, $target_alias) = @_;
+    return "toLower(" . $computer_alias . ".objectid) = toLower(" . $target_alias . ") OR toLower(" . $computer_alias . ".name) = toLower(" . $target_alias . ") OR toLower(" . $computer_alias . ".name) STARTS WITH toLower(" . $target_alias . ")";
+}
+
+# This function checks whether a node has a BloodHound kind, including the optional kinds array
+sub __bh_node_has_kind {
+    local('%node $kind @kinds $node_kind');
+    (%node, $kind) = @_;
+
+    if ($kind eq "" || $kind is $null) {
+        return 1;
+    }
+
+    if (%node["kind"] eq $kind) {
+        return 1;
+    }
+
+    @kinds = @();
+    @kinds = %node["kinds"];
+    if (@kinds !is $null) {
+        foreach $node_kind (@kinds) {
+            if ($node_kind eq $kind) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+# This function counts nodes by BloodHound kind, including the optional kinds array
+sub __bh_count_nodes_by_kind {
+    local('%nodes $kind $node_id %node $count');
+    (%nodes, $kind) = @_;
+    $count = 0;
+
+    if (%nodes is $null) {
+        return 0;
+    }
+
+    foreach $node_id => %node (%nodes) {
+        if (__bh_node_has_kind(%node, $kind) == 1) {
+            $count++;
+        }
+    }
+
+    return $count;
+}
+
+# This function returns full BloodHound AD User node data for a name, UPN, DOMAIN\user, or object ID
+sub bhGetUserInfo {
+    local('$target @candidates $query $response %nodes');
+    $target = __bh_trim($1);
+
+    if ($target eq "") {
+        show_error("[BloodHound] bhGetUserInfo requires a username, UPN, DOMAIN\\user, or object ID.");
+        return %(status => 400, headers => %(), content => %(data => %(nodes => %(), edges => @())), isFileDownload => 0);
+    }
+
+    @candidates = __bh_user_target_candidates($target);
+    $query = "WITH " . __bh_cypher_string_list(@candidates) . " AS targetNames UNWIND targetNames AS targetName MATCH (u:User) WHERE " . __bh_user_match_expression("u", "targetName") . " RETURN DISTINCT u";
+    $response = bhRunCypherWithProperties($query);
+
+    if (__bh_response_success($response["status"]) == 0) {
+        return $response;
+    }
+
+    %nodes = $response["content"]["data"]["nodes"];
+    if (%nodes is $null || size(%nodes) == 0) {
+        show_error("[BloodHound] No matching AD user node was found for: " . $target);
+    }
+
+    return $response;
+}
+
+# This function returns full BloodHound AD Computer node data for a computer name, DOMAIN\computer, or object ID
+sub bhGetComputerInfo {
+    local('$target @candidates $query $response %nodes');
+    $target = __bh_trim($1);
+
+    if ($target eq "") {
+        show_error("[BloodHound] bhGetComputerInfo requires a computer name, DOMAIN\\computer, or object ID.");
+        return %(status => 400, headers => %(), content => %(data => %(nodes => %(), edges => @())), isFileDownload => 0);
+    }
+
+    @candidates = __bh_user_target_candidates($target);
+    $query = "WITH " . __bh_cypher_string_list(@candidates) . " AS targetNames UNWIND targetNames AS targetName MATCH (c:Computer) WHERE " . __bh_computer_match_expression("c", "targetName") . " RETURN DISTINCT c";
+    $response = bhRunCypherWithProperties($query);
+
+    if (__bh_response_success($response["status"]) == 0) {
+        return $response;
+    }
+
+    %nodes = $response["content"]["data"]["nodes"];
+    if (%nodes is $null || size(%nodes) == 0) {
+        show_error("[BloodHound] No matching AD computer node was found for: " . $target);
+    }
+
+    return $response;
+}
+
+sub bhGetADCSTemplateInfo{
+    local('$target @candidates $query $response %nodes');
+    $target = __bh_trim($1);
+
+    if ($target eq "") {
+        show_error("[BloodHound] bhGetADCSTemplateInfo requires a certificate template name or object ID.");
+        return %(status => 400, headers => %(), content => %(data => %(nodes => %(), edges => @())), isFileDownload => 0);
+    }
+
+    @candidates = __bh_user_target_candidates($target);
+    $query = "WITH " . __bh_cypher_string_list(@candidates) . " AS targetNames UNWIND targetNames AS targetName MATCH (c:CertTemplate) WHERE " . __bh_user_match_expression("c", "targetName") . " RETURN DISTINCT c";
+    $response = bhRunCypherWithProperties($query);
+
+    if (__bh_response_success($response["status"]) == 0) {
+        return $response;
+    }
+
+    %nodes = $response["content"]["data"]["nodes"];
+    if (%nodes is $null || size(%nodes) == 0) {
+        show_error("[BloodHound] No matching ADCS certificate template node was found for: " . $target);
+    }
+
+    return $response;
+}
+
+# This function returns BloodHound groups reached through MemberOf for a name, UPN, DOMAIN\user, or object ID
+sub bhGetUserGroups {
+    local('$target @candidates $query $response %nodes');
+    $target = __bh_trim($1);
+
+    if ($target eq "") {
+        show_error("[BloodHound] bhGetUserGroups requires a username, UPN, DOMAIN\\user, or object ID.");
+        return %(status => 400, headers => %(), content => %(data => %(nodes => %(), edges => @())), isFileDownload => 0);
+    }
+
+    @candidates = __bh_user_target_candidates($target);
+    $query = "WITH " . __bh_cypher_string_list(@candidates) . " AS targetNames UNWIND targetNames AS targetName MATCH (u:User) WHERE " . __bh_user_match_expression("u", "targetName") . " OPTIONAL MATCH (u)-[:MemberOf*1..]->(g:Group) RETURN DISTINCT u, g";
+    $response = bhRunCypher($query);
+
+    if (__bh_response_success($response["status"]) == 0) {
+        return $response;
+    }
+
+    %nodes = $response["content"]["data"]["nodes"];
+    if (%nodes is $null || size(%nodes) == 0) {
+        show_error("[BloodHound] No matching AD user node was found for: " . $target);
+    }
+    else if (__bh_count_nodes_by_kind(%nodes, "Group") == 0) {
+        show_error("[BloodHound] No group memberships were found for: " . $target);
+    }
+
+    return $response;
+}
+
+# This function returns BloodHound groups reached through MemberOf for a computer name, DOMAIN\computer, or object ID
+sub bhGetComputerGroups {
+    local('$target @candidates $query $response %nodes');
+    $target = __bh_trim($1);
+
+    if ($target eq "") {
+        show_error("[BloodHound] bhGetComputerGroups requires a computer name, DOMAIN\\computer, or object ID.");
+        return %(status => 400, headers => %(), content => %(data => %(nodes => %(), edges => @())), isFileDownload => 0);
+    }
+
+    @candidates = __bh_user_target_candidates($target);
+    $query = "WITH " . __bh_cypher_string_list(@candidates) . " AS targetNames UNWIND targetNames AS targetName MATCH (c:Computer) WHERE " . __bh_computer_match_expression("c", "targetName") . " OPTIONAL MATCH (c)-[:MemberOf*1..]->(g:Group) RETURN DISTINCT c, g";
+    $response = bhRunCypher($query);
+
+    if (__bh_response_success($response["status"]) == 0) {
+        return $response;
+    }
+
+    %nodes = $response["content"]["data"]["nodes"];
+    if (%nodes is $null || size(%nodes) == 0) {
+        show_error("[BloodHound] No matching AD computer node was found for: " . $target);
+    }
+    else if (__bh_count_nodes_by_kind(%nodes, "Group") == 0) {
+        show_error("[BloodHound] No group memberships were found for computer: " . $target);
+    }
+
+    return $response;
+}
+
+################### BLOODHOUND NODE HELPERS ###################
+
+# This function returns the BloodHound object ID carried by a graph node map
+sub __bh_graph_node_object_id {
+    local('%node %properties $object_id');
+    %node = $1;
+
+    if (%node is $null) {
+        return "";
+    }
+
+    if (%node["objectId"] !is $null && %node["objectId"] ne "") {
+        return "" . %node["objectId"];
+    }
+    if (%node["objectid"] !is $null && %node["objectid"] ne "") {
+        return "" . %node["objectid"];
+    }
+
+    %properties = %node["properties"];
+    if (%properties !is $null) {
+        if (%properties["objectid"] !is $null && %properties["objectid"] ne "") {
+            return "" . %properties["objectid"];
+        }
+        if (%properties["objectId"] !is $null && %properties["objectId"] ne "") {
+            return "" . %properties["objectId"];
+        }
+    }
+
+    return "";
+}
+
+# This function returns a compact readable error body for BloodHound UI messages
+sub __bh_response_error_text {
+    local('$response $content');
+    $response = $1;
+
+    if ($response is $null) {
+        return "";
+    }
+
+    $content = $response["content"];
+    if ($content is $null || $content eq "") {
+        return "";
+    }
+
+    return "" . $content;
+}
+
+bhCheckConnection();
+
+################### BLOODHOUND POPUP EXTENSION ###################
+
+
+# BloodHound credential-store, table, beacon, and lookup popup actions.
+
+################### SELECTION AND PREDICATE HELPERS ###################
+
+sub __bh_selected_credential_rows_or_error {
+    local('@rows');
+    @rows = $1;
+
+    if (size(@rows) == 0) {
+        show_error("Select at least one credential row.");
+        return @();
+    }
+
+    return @rows;
+}
+
+sub __is_sid {
+    local('$value');
+    $value = __bh_trim($1);
+    return iff($value ismatch "^[sS]-\\d+(-\\d+)+$");
+}
+
+sub __user_info_table_should_show_bh_link {
+    local('@rows $field $value');
+    @rows = $1;
+
+    if (size(@rows) == 1) {
+        $field = @rows[0]["Field"];
+        $value = @rows[0]["Value"];
+
+        if ($value is $null || $value eq "") {
+            return 0;
+        }
+        if (__is_sid($value)) {
+            return 1;
+        }
+
+        if ($field eq "label" || $field eq "name" || $field eq "samaccountname" || $field eq "distinguishedname") {
+            return 1;
+        }
+        if ($field eq "objectId" || $field eq "objectid" || $field eq "objectguid" || $field eq "node_id" || $field eq "domain") {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+################### BLOODHOUND URL AND LOOKUP HELPERS ###################
+
+sub __bh_url_encode {
+    local('$value');
+    $value = "" . $1;
+    $value = [URLEncoder encode: $value, "UTF-8"];
+    return [$value replace: "+", "%20"];
+}
+
+sub __open_bh_url {
+    local('$sid');
+    $sid = $1;
+    url_open($bh_url_base . "/ui/explore?primarySearch=" . __bh_url_encode($sid) . "&searchType=node");
+}
+
+sub __credentials_trim_computer_account_suffix {
+    local('$value $at_index $account $realm');
+    $value = __bh_trim($1);
+
+    $at_index = [$value indexOf: "@"];
+    if ($at_index > 0) {
+        $account = __credentials_trim_computer_account_suffix(substr($value, 0, $at_index));
+        $realm = substr($value, $at_index);
+        return $account . $realm;
+    }
+
+    if (strlen($value) > 0 && charAt($value, strlen($value) - 1) eq "\$") {
+        return substr($value, 0, strlen($value) - 1);
+    }
+
+    return $value;
+}
+
+sub __credentials_is_computer_account_value {
+    local('$value $at_index $slash_index');
+    $value = __bh_trim($1);
+
+    $at_index = [$value indexOf: "@"];
+    if ($at_index > 0) {
+        return __credentials_is_computer_account_value(substr($value, 0, $at_index));
+    }
+
+    $slash_index = [$value indexOf: "\\"];
+    if ($slash_index > 0 && $slash_index < strlen($value) - 1) {
+        return __credentials_is_computer_account_value(substr($value, $slash_index + 1));
+    }
+
+    return iff(strlen($value) > 0 && charAt($value, strlen($value) - 1) eq "\$", 1, 0);
+}
+
+sub __beacon_bh_field_value {
+    local('$row $field $value');
+    ($row, $field) = @_;
+    $value = beacon_info($row, $field);
+
+    if ($value is $null) {
+        return "";
+    }
+
+    return __bh_trim(replace($value, '\s|\*', ""));
+}
+
+sub __beacon_bh_target_from_row {
+    local('$row $kind $value');
+    ($row, $kind) = @_;
+
+    if ($kind eq "User") {
+        $value = __beacon_bh_field_value($row, "user");
+        if ($value eq "" || __credentials_is_computer_account_value($value) == 1) {
+            return "";
+        }
+
+        return __credentials_normalize_bh_lookup_selection($value);
+    }
+
+    if ($kind eq "Computer") {
+        $value = __beacon_bh_field_value($row, "computer");
+        if ($value eq "") {
+            return "";
+        }
+
+        return __credentials_trim_computer_account_suffix($value);
+    }
+
+    return "";
+}
+
+sub __beacon_bh_run_kind_action {
+    local('@rows $kind $action $empty_message $row $target $handled');
+    @rows = $1;
+    $kind = $2;
+    $action = $3;
+    $empty_message = $4;
+    $handled = 0;
+
+    foreach $row (@rows) {
+        $target = __beacon_bh_target_from_row($row, $kind);
+        if ($target ne "") {
+            $handled = 1;
+            __credentials_bh_object_action_interactive($target, $kind, $action, $empty_message);
+        }
+    }
+
+    if ($handled == 0) {
+        show_error($empty_message);
+    }
+}
+
+sub __credentials_lookup_rows_field_in_bloodhound {
+    local('@rows $field %row');
+    @rows = __bh_selected_credential_rows_or_error($1);
+    $field = $2;
+
+    foreach %row (@rows) {
+        if (%row[$field] !is $null && %row[$field] ne "") {
+            __bh_lookup_object_interactive(%row[$field]);
+        }
+    }
+}
+
+sub __credentials_bh_node_object_name {
+    local('%node %properties $name');
+    %node = $1;
+
+    if (%node is $null) {
+        return "";
+    }
+
+    if (%node["label"] !is $null && %node["label"] ne "") {
+        return "" . %node["label"];
+    }
+
+    %properties = %node["properties"];
+    if (%properties !is $null && %properties["name"] !is $null && %properties["name"] ne "") {
+        return "" . %properties["name"];
+    }
+
+    if (%node["name"] !is $null && %node["name"] ne "") {
+        return "" . %node["name"];
+    }
+    if (%node["objectId"] !is $null && %node["objectId"] ne "") {
+        return "" . %node["objectId"];
+    }
+    if (%node["objectid"] !is $null && %node["objectid"] ne "") {
+        return "" . %node["objectid"];
+    }
+
+    return "";
+}
+
+sub __credentials_normalize_bh_lookup_selection {
+    local('$sel $slash_index $domain $user');
+    $sel = __bh_trim($1);
+    $slash_index = [$sel indexOf: "\\"];
+
+    if ($slash_index > 0 && $slash_index < strlen($sel) - 1) {
+        $domain = [$sel substring: 0, $slash_index];
+        $user = __credentials_trim_computer_account_suffix([$sel substring: $slash_index + 1]);
+        return $user . "@" . $domain;
+    }
+
+    return __credentials_trim_computer_account_suffix($sel);
+}
+
+sub __credentials_bh_prefix_search {
+    local('$sel $query');
+    $sel = __bh_trim($1);
+    $query = "WITH " . __bh_cypher_quote($sel) . " AS sel MATCH (n) WHERE toUpper(n.name) CONTAINS toUpper(sel) RETURN n ORDER BY n.name";
+    return bhRunCypherWithProperties($query);
+}
+
+sub __credentials_bh_prefix_search_names {
+    local('$response %nodes $node_id %node $name $key @names @sorted_names %seen');
+    $response = $1;
+
+    %nodes = $response["content"]["data"]["nodes"];
+    if (%nodes is $null || size(%nodes) == 0) {
+        return @();
+    }
+
+    foreach $node_id => %node (%nodes) {
+        $name = __credentials_bh_node_object_name(%node);
+        $key = lc($name);
+        if ($name ne "" && $key !in %seen) {
+            %seen[$key] = 1;
+            push(@names, $name);
+        }
+    }
+
+    @sorted_names = sorta(@names);
+    return @sorted_names;
+}
+
+sub __credentials_bh_kind_search {
+    local('$sel $kind $label $query');
+    $sel = __bh_trim($1);
+    $kind = iff(size(@_) >= 2, __bh_trim($2), "");
+    $label = iff($kind ne "", ":" . $kind, "");
+
+    $query = "WITH " . __bh_cypher_quote($sel) . " AS sel MATCH (n" . $label . ") WHERE toUpper(n.name) CONTAINS toUpper(sel) OR toUpper(n.objectid) = toUpper(sel) RETURN n ORDER BY n.name";
+    return bhRunCypherWithProperties($query);
+}
+
+sub __credentials_bh_kind_search_names {
+    local('$response $kind %nodes $node_id %node $name $key @names @sorted_names %seen');
+    ($response, $kind) = @_;
+
+    %nodes = $response["content"]["data"]["nodes"];
+    if (%nodes is $null || size(%nodes) == 0) {
+        return @();
+    }
+
+    foreach $node_id => %node (%nodes) {
+        if ($kind eq "" || __bh_node_has_kind(%node, $kind) == 1) {
+            $name = __credentials_bh_node_object_name(%node);
+            $key = lc($name);
+            if ($name ne "" && $key !in %seen) {
+                %seen[$key] = 1;
+                push(@names, $name);
+            }
+        }
+    }
+
+    @sorted_names = sorta(@names);
+    return @sorted_names;
+}
+
+sub __credentials_open_bh_object_dialog {
+    local('@object_names $dialog');
+    @object_names = $1;
+
+    $dialog = dialog("Select BloodHound Object", %(object_name => @object_names[0]), lambda({
+        __open_bh_url($3["object_name"]);
+    }));
+    drow_combobox($dialog, "object_name", "Object Name: ", @object_names);
+    dbutton_action($dialog, "Lookup");
+    dialog_show($dialog);
+}
+
+sub __credentials_bh_response_error_message {
+    local('$message $response $status $detail');
+    ($message, $response) = @_;
+    $status = $response["status"];
+    $detail = __bh_response_error_text($response);
+
+    return $message . " with status " . $status . iff($detail ne "", "\n\nServer response:\n" . $detail, "");
+}
+
+sub __bh_lookup_object_interactive {
+    local('$sel $lookup_value $response @object_names');
+    $sel = __bh_trim($1);
+
+    if ($sel eq "") {
+        show_error("Select text to lookup in BloodHound.");
+        return;
+    }
+
+    if (__is_sid($sel)) {
+        __open_bh_url($sel);
+        return;
+    }
+
+    $lookup_value = __credentials_normalize_bh_lookup_selection($sel);
+    $response = __credentials_bh_prefix_search($lookup_value);
+
+    if (__bh_response_success($response["status"]) == 0) {
+        show_error(__credentials_bh_response_error_message("BloodHound lookup failed", $response));
+        return;
+    }
+
+    @object_names = __credentials_bh_prefix_search_names($response);
+
+    if (size(@object_names) == 0) {
+        show_error("No BloodHound objects found for: " . $lookup_value);
+        return;
+    }
+    if (size(@object_names) == 1) {
+        __open_bh_url(@object_names[0]);
+        return;
+    }
+
+    __credentials_open_bh_object_dialog(@object_names);
+}
+
+sub __credentials_run_bh_object_action {
+    local('$target $kind $action');
+    ($target, $kind, $action) = @_;
+
+    if ($action eq "lookup") {
+        __open_bh_url($target);
+        return;
+    }
+    if ($action eq "info") {
+        __credentials_display_bh_object_info($target, $kind);
+        return;
+    }
+    if ($action eq "groups") {
+        __credentials_display_bh_object_groups($target, $kind);
+        return;
+    }
+    if ($action eq "owned") {
+        __credentials_mark_bh_target_as_owned($target, "Select an object to add to Owned.");
+        return;
+    }
+}
+
+sub __credentials_open_bh_action_dialog {
+    local('@object_names $kind $action $title $button $dialog');
+    (@object_names, $kind, $action) = @_;
+
+    $title = "Select BloodHound " . iff($kind eq "", "Object", $kind);
+    $button = "Select";
+
+    if ($action eq "info") {
+        $button = "Get Info";
+    }
+    else if ($action eq "lookup") {
+        $button = "Lookup";
+    }
+    else if ($action eq "groups") {
+        $button = "Get Groups";
+    }
+    else if ($action eq "owned") {
+        $button = "Add to Owned";
+    }
+
+    $dialog = dialog($title, %(object_name => @object_names[0], object_kind => $kind, object_action => $action), lambda({
+        __credentials_run_bh_object_action($3["object_name"], $3["object_kind"], $3["object_action"]);
+    }));
+    drow_combobox($dialog, "object_name", "Object Name: ", @object_names);
+    dbutton_action($dialog, $button);
+    dialog_show($dialog);
+}
+
+sub __credentials_bh_object_action_kind {
+    local('$target $requested_kind');
+    ($target, $requested_kind) = @_;
+
+    if ($requested_kind ne "") {
+        return $requested_kind;
+    }
+
+    if (__credentials_is_computer_account_value($target) == 1) {
+        return "Computer";
+    }
+
+    return "User";
+}
+
+sub __credentials_bh_object_action_label {
+    local('$kind');
+    $kind = $1;
+    return iff($kind eq "", "objects", lc($kind) . " objects");
+}
+
+sub __credentials_bh_owned_kind_options {
+    local('$target');
+    $target = $1;
+
+    if (__credentials_is_computer_account_value($target) == 1) {
+        return "Computer";
+    }
+
+    return "";
+}
+
+sub __credentials_bh_action_requires_kind {
+    local('$action');
+    $action = $1;
+
+    if ($action eq "lookup" || $action eq "info" || $action eq "groups" || $action eq "owned") {
+        return 1;
+    }
+
+    return 0;
+}
+
+sub __credentials_bh_object_action_interactive {
+    local('$sel $kind $action $empty_message $lookup_value $response @object_names $kind_label');
+    ($sel, $kind, $action, $empty_message) = @_;
+    $sel = __bh_trim($sel);
+    $kind = __bh_trim($kind);
+
+    if ($sel eq "") {
+        show_error($empty_message);
+        return;
+    }
+
+    $lookup_value = __credentials_normalize_bh_lookup_selection($sel);
+    if (__credentials_bh_action_requires_kind($action) == 1) {
+        $kind = __credentials_bh_object_action_kind($lookup_value, $kind);
+    }
+    $response = __credentials_bh_kind_search($lookup_value, $kind);
+
+    if (__bh_response_success($response["status"]) == 0) {
+        show_error(__credentials_bh_response_error_message("BloodHound object lookup failed", $response));
+        return;
+    }
+
+    @object_names = __credentials_bh_kind_search_names($response, $kind);
+    if (size(@object_names) == 0) {
+        $kind_label = __credentials_bh_object_action_label($kind);
+        show_error("No BloodHound " . $kind_label . " found for: " . $lookup_value);
+        return;
+    }
+    if (size(@object_names) == 1) {
+        __credentials_run_bh_object_action(@object_names[0], $kind, $action);
+        return;
+    }
+
+    __credentials_open_bh_action_dialog(@object_names, $kind, $action);
+}
+
+sub __credentials_row_lookup_value {
+    local('%row @fields $field');
+    %row = $1;
+    @fields = @("objectSid", "objectSID", "objectid", "objectId", "name", "sAMAccountName", "dNSHostName", "cn", "distinguishedName");
+
+    foreach $field (@fields) {
+        if (%row[$field] !is $null && %row[$field] ne "") {
+            return %row[$field];
+        }
+    }
+
+    return "";
+}
+
+sub __ldap_query_lookup_in_bloodhound {
+    local('@rows %info $table $idx $lookup_value %row');
+    (@rows, %info, $table) = @_;
+
+    foreach $idx => %row (@rows) {
+        $lookup_value = __credentials_row_lookup_value(%row);
+        if ($lookup_value) {
+            __bh_lookup_object_interactive($lookup_value);
+        }
+    }
+}
+
+sub __adcs_enum_lookup_templatename_in_bloodhound {
+    local('@rows %info $table $templateName $idx %row');
+    (@rows, %info, $table) = @_;
+
+    foreach $idx => %row (@rows) {
+        $templateName = iff(%row["Template Name"], %row["Template Name"], %row["Enterprise CA Name"]);
+        if ($templateName) {
+            __bh_lookup_object_interactive($templateName);
+        }
+    }
+}
+
+sub __beacon_lookup_username_in_bloodhound {
+    local('@rows %info $table');
+    (@rows, %info, $table) = @_;
+    __beacon_bh_run_kind_action($1, "User", "lookup", "Selected Beacon row has no user value.");
+}
+
+sub __beacon_lookup_computer_in_bloodhound {
+    local('@rows %info $table');
+    (@rows, %info, $table) = @_;
+    __beacon_bh_run_kind_action($1, "Computer", "lookup", "Selected Beacon row has no computer value.");
+}
+
+sub __credentials_mark_bh_target_as_owned {
+    local('$target $empty_message $response');
+    ($target, $empty_message) = @_;
+    $target = __bh_trim($target);
+
+    if ($target eq "") {
+        show_error($empty_message);
+        return;
+    }
+
+    $response = bhAddToOwned($target);
+    if (__bh_response_success($response["status"]) == 1) {
+        println("[BloodHound] Add to Owned: " . $target);
+        show_message($target . " has been added to Owned.");
+    }
+    else if ($response["status"] == 409) {
+        show_error($target . " was already added to Owned.");
+    }
+    else {
+        show_error(__credentials_bh_response_error_message("BloodHound mark as owned failed for " . $target, $response));
+    }
+}
+
+sub __beacon_mark_username_as_owned {
+    local('@rows %info $table');
+    (@rows, %info, $table) = @_;
+    __beacon_bh_run_kind_action($1, "User", "owned", "Selected Beacon row has no user value.");
+}
+
+sub __beacon_mark_computer_as_owned {
+    local('@rows %info $table');
+    (@rows, %info, $table) = @_;
+    __beacon_bh_run_kind_action($1, "Computer", "owned", "Selected Beacon row has no computer value.");
+}
+
+################### BLOODHOUND CREDENTIAL ACTIONS ###################
+
+sub __credentials_display_selected_user_info {
+    local('@rows %row $target');
+    @rows = __bh_selected_credential_rows_or_error($1);
+
+    foreach %row (@rows) {
+        $target = __credentials_bh_owned_target_from_credential(%row);
+        __credentials_bh_object_action_interactive($target, "", "info", "Selected credential row has no user value.");
+    }
+}
+
+sub __credentials_display_selected_user_groups {
+    local('@rows %row $target');
+    @rows = __bh_selected_credential_rows_or_error($1);
+
+    foreach %row (@rows) {
+        $target = __credentials_bh_owned_target_from_credential(%row);
+        __credentials_bh_object_action_interactive($target, "", "groups", "Selected credential row has no user value.");
+    }
+}
+
+sub __credentials_bh_owned_target_from_credential {
+    local('%row $user $realm');
+    %row = $1;
+
+    $user = __credentials_trim_computer_account_suffix(%row["user"]);
+    $realm = __bh_trim(%row["realm"]);
+
+    if ($user eq "") {
+        return "";
+    }
+
+    if (__credentials_is_computer_account_value(%row["user"]) == 1) {
+        return $user;
+    }
+
+    if ($realm ne "") {
+        return $user . "@" . $realm;
+    }
+
+    return $user;
+}
+
+sub __credentials_mark_selected_as_owned {
+    local('@rows %row $target');
+    @rows = __bh_selected_credential_rows_or_error($1);
+
+    foreach %row (@rows) {
+        $target = __credentials_bh_owned_target_from_credential(%row);
+        __credentials_bh_object_action_interactive($target, __credentials_bh_owned_kind_options(%row["user"]), "owned", "Selected credential row has no user value.");
+    }
+}
+
+################### BLOODHOUND TABLE HELPERS ###################
+
+sub __credentials_bh_table_value {
+    local('$value @parts $item $key $nested_value');
+    $value = $1;
+
+    if ($value is $null) {
+        return "";
+    }
+
+    if (-isarray $value) {
+        foreach $item ($value) {
+            push(@parts, __credentials_bh_table_value($item));
+        }
+        return join(", ", @parts);
+    }
+
+    if (-ishash $value) {
+        foreach $key => $nested_value ($value) {
+            push(@parts, $key . "=" . __credentials_bh_table_value($nested_value));
+        }
+        return join("; ", @parts);
+    }
+
+    return "" . $value;
+}
+
+sub __credentials_bh_preferred_user_fields {
+    return @(
+        "name",
+        "samaccountname",
+        "domain",
+        "distinguishedname",
+        "objectid",
+        "objectguid",
+        "enabled",
+        "admincount",
+        "adminsdholderprotected",
+        "isaclprotected",
+        "hasspn",
+        "serviceprincipalnames",
+        "dontreqpreauth",
+        "pwdneverexpires",
+        "passwordnotreqd",
+        "passwordexpired",
+        "lockedout",
+        "sensitive",
+        "trustedtoauth",
+        "unconstraineddelegation",
+        "lastlogon",
+        "lastlogontimestamp",
+        "pwdlastset",
+        "whencreated",
+        "lastseen",
+        "lastcollected",
+        "system_tags"
+    );
+}
+
+sub __credentials_user_info_table_rows {
+    local('$target $response $node_kind $kind_label %nodes $node_id %node %properties $node_label @rows @preferred_fields %seen_fields $field $value');
+    ($target, $response) = @_;
+    $node_kind = iff(size(@_) >= 3 && $3 ne "", $3, "User");
+    $kind_label = lc($node_kind);
+
+    %nodes = $response["content"]["data"]["nodes"];
+    if (%nodes is $null || size(%nodes) == 0) {
+        push(@rows, @($target, "result", "No matching BloodHound " . $kind_label . " found."));
+        return @rows;
+    }
+
+    @preferred_fields = __credentials_bh_preferred_user_fields();
+
+    foreach $node_id => %node (%nodes) {
+        if (__bh_node_has_kind(%node, $node_kind) == 1) {
+            %seen_fields = %();
+            %properties = %node["properties"];
+            if (%properties is $null) {
+                %properties = %();
+            }
+            $node_label = iff(%node["label"] is $null || %node["label"] eq "", $node_id, %node["label"]);
+
+            push(@rows, @($node_label, "label", __credentials_bh_table_value(%node["label"])));
+            push(@rows, @($node_label, "node_id", __credentials_bh_table_value($node_id)));
+            push(@rows, @($node_label, "kind", __credentials_bh_table_value(%node["kind"])));
+            push(@rows, @($node_label, "kinds", __credentials_bh_table_value(%node["kinds"])));
+            push(@rows, @($node_label, "objectId", __credentials_bh_table_value(%node["objectId"])));
+            push(@rows, @($node_label, "isTierZero", __credentials_bh_table_value(%node["isTierZero"])));
+            push(@rows, @($node_label, "isOwnedObject", __credentials_bh_table_value(%node["isOwnedObject"])));
+
+            foreach $field (@preferred_fields) {
+                if (%properties[$field] !is $null) {
+                    push(@rows, @($node_label, $field, __credentials_bh_table_value(%properties[$field])));
+                    %seen_fields[$field] = 1;
+                }
+            }
+
+            foreach $field => $value (%properties) {
+                if ($field !in %seen_fields) {
+                    push(@rows, @($node_label, $field, __credentials_bh_table_value($value)));
+                }
+            }
+        }
+    }
+
+    if (size(@rows) == 0) {
+        push(@rows, @($target, "result", "No matching BloodHound " . $kind_label . " found."));
+    }
+
+    return @rows;
+}
+
+sub __credentials_user_groups_table_rows {
+    local('$response %nodes $node_id %node %properties $group_label %seen $seen_key @rows');
+    $response = $1;
+
+    %nodes = $response["content"]["data"]["nodes"];
+    if (%nodes is $null || size(%nodes) == 0) {
+        push(@rows, @("No BloodHound group memberships found."));
+        return @rows;
+    }
+
+    foreach $node_id => %node (%nodes) {
+        if (__bh_node_has_kind(%node, "Group") == 1) {
+            %properties = %node["properties"];
+            if (%properties is $null) {
+                %properties = %();
+            }
+
+            $group_label = iff(%node["label"] !is $null && %node["label"] ne "", %node["label"], %properties["name"]);
+            if ($group_label is $null || $group_label eq "") {
+                $group_label = iff(%node["objectId"] !is $null && %node["objectId"] ne "", %node["objectId"], $node_id);
+            }
+
+            $seen_key = lc("" . $group_label);
+            if ($seen_key !in %seen) {
+                %seen[$seen_key] = 1;
+                push(@rows, @($group_label));
+            }
+        }
+    }
+
+    if (size(@rows) == 0) {
+        push(@rows, @("No BloodHound group memberships found."));
+    }
+
+    return @rows;
+}
+
+################### BLOODHOUND TABLE DISPLAYS ###################
+
+sub __credentials_try_open_user_defined_browser {
+    local('$tableID $tabName @columnNames @rows @columnWidths %callbackHints');
+    ($tableID, $tabName, @columnNames, @rows, @columnWidths, %callbackHints) = @_;
+
+    try {
+        openUserDefinedBrowser($tableID, $tabName, @columnNames, @rows, @columnWidths, %callbackHints);
+        return 1;
+    }
+    catch $e {
+        return 0;
+    }
+}
+
+sub __credentials_show_bh_table_request_error {
+    local('$action $target $response');
+    ($action, $target, $response) = @_;
+
+    show_error(__credentials_bh_response_error_message($action . " failed for " . $target, $response));
+}
+
+sub __credentials_display_bh_object_info {
+    local('$tableID $tabName $target_user $response $node_kind $action');
+    local('@columnNames @data @columnWidths %callbackHints');
+    ($target_user, $node_kind) = @_;
+
+    if ($target_user eq "") {
+        show_error("Select a BloodHound object to display.");
+        return;
+    }
+
+    if ($node_kind eq "Computer") {
+        $action = "BloodHound computer info request";
+        $response = bhGetComputerInfo($target_user);
+    }
+    else {
+        $node_kind = "User";
+        $action = "BloodHound user info request";
+        $response = bhGetUserInfo($target_user);
+    }
+
+    if (__bh_response_success($response["status"]) == 0) {
+        __credentials_show_bh_table_request_error($action, $target_user, $response);
+        return;
+    }
+
+    $tableID = "UserInfoTable";
+    $tabName = $target_user . " - " . $node_kind . " Info";
+    @columnNames = @("Object", "Field", "Value");
+    @data = __credentials_user_info_table_rows($target_user, $response, $node_kind);
+    @columnWidths = @(220, 180, 520);
+
+    if (__credentials_try_open_user_defined_browser($tableID, $tabName, @columnNames, @data, @columnWidths, %callbackHints) == 0) {
+        show_error("This Cobalt Strike version does not support custom tables. Upgrade Cobalt Strike to use this table view.");
+    }
+}
+
+sub __credentials_display_bh_object_groups {
+    local('$tableID $tabName $target_user $response $action $object_type');
+    local('@columnNames @data @columnWidths %callbackHints');
+    ($target_user, $object_type) = @_;
+
+    if ($target_user eq "") {
+        show_error("Select a BloodHound object to display.");
+        return;
+    }
+
+    if ($object_type eq "Computer") {
+        $action = "BloodHound computer groups request";
+        $response = bhGetComputerGroups($target_user);
+    }
+    else {
+        $action = "BloodHound user groups request";
+        $object_type = "User";
+        $response = bhGetUserGroups($target_user);
+    }
+
+    if (__bh_response_success($response["status"]) == 0) {
+        __credentials_show_bh_table_request_error($action, $target_user, $response);
+        return;
+    }
+
+    $tableID = "UserGroupsTable";
+    $tabName = $target_user . " - BloodHound " . $object_type . " Groups";
+    @columnNames = @("Group");
+    @data = __credentials_user_groups_table_rows($response);
+    @columnWidths = @(520);
+
+    if (__credentials_try_open_user_defined_browser($tableID, $tabName, @columnNames, @data, @columnWidths, %callbackHints) == 0) {
+        show_error("This Cobalt Strike version does not support custom tables. Upgrade Cobalt Strike to use this table view.");
+    }
+}
+
+################### POPUP REGISTRATION ###################
+
+try {
+    popup credentials {
+        separator();
+        menu "&Bloodhound" {
+            item "Get User Info" {
+                __credentials_display_selected_user_info($1);
+            }
+            item "Get User Groups" {
+                __credentials_display_selected_user_groups($1);
+            }
+            item "Add to Owned" {
+                __credentials_mark_selected_as_owned($1);
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}
+
+try {
+    popup UserInfoTable {
+        if (__user_info_table_should_show_bh_link($1)) {
+            separator();
+            menu "&Bloodhound" {
+                item "Lookup in Bloodhound" {
+                    __credentials_lookup_rows_field_in_bloodhound($1, "Value");
+                }
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}
+
+try {
+    popup UserGroupsTable {
+        separator();
+        menu "&Bloodhound" {
+            item "Lookup in Bloodhound" {
+                __credentials_lookup_rows_field_in_bloodhound($1, "Group");
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}
+
+try {
+    popup beacon_console_popup {
+        local('$bid $sel @lines %opts @fields $i $loops');
+        $bid = $1;
+        $sel = $2;
+
+        item "Search in DuckDuckGo ..." {
+            url_open("https://duckduckgo.com/?q=" . $2);
+        }
+        if ($sel ne "") {
+            item "Lookup in Bloodhound" {
+                __bh_lookup_object_interactive($2);
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}
+
+try {
+    popup beacon {
+        local('@rows %row');
+        @rows = $1;
+
+        if (size(@rows) == 1) {
+            menu "&Bloodhound" {
+                menu "&User" {
+                    item "Lookup Username" {
+                        __beacon_lookup_username_in_bloodhound($1);
+                    }
+                    item "Add User to Owned" {
+                        __beacon_mark_username_as_owned($1);
+                    }
+                }
+                menu "&Computer" {
+                    item "Lookup Computer" {
+                        __beacon_lookup_computer_in_bloodhound($1);
+                    }
+                    item "Add Computer to Owned" {
+                        __beacon_mark_computer_as_owned($1);
+                    }
+                }
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}
+
+################### TRUSTEDSEC SA TABLE POPUPS ###################
+
+
+# TrustedSec SA BOF table popup actions backed by BloodHound helpers.
+
+try {
+    popup "ldap-query" {
+        menu "&Bloodhound" {
+            item "Lookup in Bloodhound" {
+                __ldap_query_lookup_in_bloodhound($1, $2, $3);
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}
+
+try {
+    popup "ldapsearch" {
+        menu "&Bloodhound" {
+            item "Lookup in Bloodhound" {
+                __ldap_query_lookup_in_bloodhound($1, $2, $3);
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}
+
+try {
+    popup "adcs-enum" {
+        local('@rows %row');
+        @rows = $1;
+
+        if (size(@rows) == 1) {
+            menu "&Bloodhound" {
+                item "Lookup Certificate Template in Bloodhound" {
+                    __adcs_enum_lookup_templatename_in_bloodhound($1, $2, $3);
+                }
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}
+
+try {
+    popup "adcs_enum" {
+        local('@rows %row');
+        @rows = $1;
+
+        if (size(@rows) == 1) {
+            menu "&Bloodhound" {
+                item "Lookup Certificate Template in Bloodhound" {
+                    __adcs_enum_lookup_templatename_in_bloodhound($1, $2, $3);
+                }
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}

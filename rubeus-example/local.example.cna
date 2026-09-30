@@ -1,0 +1,7 @@
+# Copy this file to local.cna in this same directory and update local values.
+# modules/alerts/Teams/local.cna is intentionally ignored by git.
+
+global('$teamserver_hostname $teams_webhookURL');
+
+$teamserver_hostname = "";
+$teams_webhookURL = "";

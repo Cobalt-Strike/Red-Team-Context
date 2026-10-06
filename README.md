@@ -5,6 +5,8 @@ A collection of Cobalt Strike Aggressor Script examples that bring tool output a
 > [!NOTE]
 > This project is under active development and may introduce breaking changes.
 
+## Examples
+
 | Script | Description | Documentation |
 | --- | --- | --- |
 | `bloodhound.cna` | Connects to BloodHound CE/Enterprise for user, computer, group, and ADCS lookups, plus Owned marking from Cobalt Strike menus. | [BloodHound example](bloodhound-example/README.md) |
@@ -13,15 +15,15 @@ A collection of Cobalt Strike Aggressor Script examples that bring tool output a
 
 Follow each example's README for configuration, dependencies, and loading instructions. Custom tables require Cobalt Strike 4.13 or later. Rubeus and the compiled TrustedSec BOFs must be supplied separately. Loading the BloodHound example also adds lookup actions to the SA tables.
 
-## Screenshots
+### Screenshots
 
-### BloodHound
+#### BloodHound
 
 ![BloodHound user information lookup](bloodhound-example/screenshots/get_user_info.png)
 
 *The credential-row BloodHound menu opens user properties in a dedicated User Info table.*
 
-### Rubeus
+#### Rubeus
 
 ![Rubeus triage results](rubeus-example/screenshots/triage.png)
 
@@ -31,7 +33,7 @@ Follow each example's README for configuration, dependencies, and loading instru
 
 *The Rubeus context menu provides an `asktgt` action to request a Kerberos ticket using the selected credential.*
 
-### TrustedSec SA
+#### TrustedSec SA
 
 ![TrustedSec SA LDAP search results](TrustedSec-CS-Situational-Awareness-BOF/screenshots/ldapsearch.png)
 

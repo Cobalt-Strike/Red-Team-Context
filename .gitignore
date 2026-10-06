@@ -24,4 +24,4 @@ hs_err_pid*
 replay_pid*
 
 # Local BloodHound API credentials
-config/local.cna
+*local.cna

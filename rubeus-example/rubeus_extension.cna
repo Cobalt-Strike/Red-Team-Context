@@ -1,5 +1,5 @@
 debug(7 | 34); # 34 is required for try/catch
-include(script_resource("../rubeus/rubeus_proxy.cna"));
+include(script_resource("rubeus_proxy.cna"));
 
 # Rubeus credential-store popup actions.
 

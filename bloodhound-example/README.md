@@ -18,8 +18,10 @@ Load `bloodhound.cna` directly from Script Manager; it carries its own REST tran
 
 ```text
 --add-exports=java.base/sun.net.www.protocol.https=ALL-UNNAMED
+--add-exports=java.base/sun.net.www.protocol.http=ALL-UNNAMED
 --add-exports=java.base/sun.net.www.http=ALL-UNNAMED
 --add-opens=java.base/sun.net.www.protocol.https=ALL-UNNAMED
+--add-opens=java.base/sun.net.www.protocol.http=ALL-UNNAMED
 --add-opens=java.base/sun.net.www.http=ALL-UNNAMED
 ```
 
